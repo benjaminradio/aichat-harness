@@ -6,7 +6,7 @@ use self::completer::ReplCompleter;
 use self::highlighter::ReplHighlighter;
 use self::prompt::ReplPrompt;
 
-use crate::client::{call_chat_completions, call_chat_completions_streaming};
+use crate::harness::run_completion_loop;
 use crate::config::{
     macro_execute, AgentVariables, AssertState, Config, GlobalConfig, Input, LastMessage,
     StateFlags,
@@ -31,7 +31,7 @@ use std::{env, process};
 
 const MENU_NAME: &str = "completion_menu";
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 36]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 39]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -184,6 +184,21 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 36]> = LazyLock::new(|| {
             AssertState::pass(),
         ),
         ReplCommand::new(".exit", "Exit REPL", AssertState::pass()),
+        ReplCommand::new(
+            ".harness",
+            "Enter harness mode, optionally activating an agent",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".info harness",
+            "Show harness info",
+            AssertState::True(StateFlags::HARNESS),
+        ),
+        ReplCommand::new(
+            ".exit harness",
+            "Exit harness mode",
+            AssertState::True(StateFlags::HARNESS),
+        ),
     ]
 });
 static COMMAND_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(\.\S*)\s*").unwrap());
@@ -403,6 +418,10 @@ pub async fn run_repl_command(
                     let info = config.read().agent_info()?;
                     print!("{info}");
                 }
+                Some("harness") => {
+                    let info = config.read().harness_info()?;
+                    print!("{info}");
+                }
                 Some(_) => unknown_command()?,
                 None => {
                     let output = config.read().sysinfo()?;
@@ -478,6 +497,21 @@ pub async fn run_repl_command(
                     println!(r#"Usage: .agent <agent-name> [session-name] [key=value]..."#)
                 }
             },
+            ".harness" => match args {
+                Some(agent_name) => {
+                    config.write().harness_active = true;
+                    let ret =
+                        Config::use_agent(config, agent_name.trim(), None, abort_signal.clone())
+                            .await;
+                    if ret.is_ok() {
+                        config.write().harness_activated_agent = true;
+                    }
+                    ret?;
+                }
+                None => {
+                    config.write().harness_active = true;
+                }
+            },
             ".starter" => match args {
                 Some(id) => {
                     let mut text = None;
@@ -508,11 +542,14 @@ pub async fn run_repl_command(
                 Some(("role", name)) => {
                     config.write().save_role(name)?;
                 }
+                Some(("agent", name)) => {
+                    config.write().save_agent(name)?;
+                }
                 Some(("session", name)) => {
                     config.write().save_session(name)?;
                 }
                 _ => {
-                    println!(r#"Usage: .save <role|session> [name]"#)
+                    println!(r#"Usage: .save <role|agent|session> [name]"#)
                 }
             },
             ".edit" => {
@@ -690,6 +727,9 @@ pub async fn run_repl_command(
                 Some("agent") => {
                     config.write().exit_agent()?;
                 }
+                Some("harness") => {
+                    config.write().exit_harness()?;
+                }
                 Some(_) => unknown_command()?,
                 None => {
                     return Ok(true);
@@ -716,7 +756,6 @@ pub async fn run_repl_command(
     Ok(false)
 }
 
-#[async_recursion::async_recursion]
 async fn ask(
     config: &GlobalConfig,
     abort_signal: AbortSignal,
@@ -733,29 +772,11 @@ async fn ask(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    let client = input.create_client()?;
-    config.write().before_chat_completion(&input)?;
-    let (output, tool_results) = if input.stream() {
-        call_chat_completions_streaming(&input, client.as_ref(), abort_signal.clone()).await?
-    } else {
-        call_chat_completions(&input, true, false, client.as_ref(), abort_signal.clone()).await?
-    };
-    config
-        .write()
-        .after_chat_completion(&input, &output, &tool_results)?;
-    if !tool_results.is_empty() {
-        ask(
-            config,
-            abort_signal,
-            input.merge_tool_results(output, tool_results),
-            false,
-        )
-        .await
-    } else {
-        Config::maybe_autoname_session(config.clone());
-        Config::maybe_compress_session(config.clone());
-        Ok(())
-    }
+    run_completion_loop(config, input, false, None, abort_signal).await?;
+
+    Config::maybe_autoname_session(config.clone());
+    Config::maybe_compress_session(config.clone());
+    Ok(())
 }
 
 fn unknown_command() -> Result<()> {

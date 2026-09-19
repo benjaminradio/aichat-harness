@@ -289,6 +289,11 @@ pub struct ChatCompletionsData {
 #[derive(Debug, Clone, Default)]
 pub struct ChatCompletionsOutput {
     pub text: String,
+    /// Populated directly by each provider's response parser from that provider's
+    /// own reasoning/thinking field. Never embedded into `text` — see
+    /// `render::format_reasoning` for the `<think>` display-time wrapping this
+    /// replaces.
+    pub reasoning_content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub id: Option<String>,
     pub input_tokens: Option<u64>,
@@ -409,11 +414,11 @@ pub async fn call_chat_completions(
     extract_code: bool,
     client: &dyn Client,
     abort_signal: AbortSignal,
-) -> Result<(String, Vec<ToolResult>)> {
+) -> Result<(String, Option<String>, Vec<ToolResult>)> {
     let ret = abortable_run_with_spinner(
         client.chat_completions(input.clone()),
         "Generating",
-        abort_signal,
+        abort_signal.clone(),
     )
     .await;
 
@@ -421,18 +426,23 @@ pub async fn call_chat_completions(
         Ok(ret) => {
             let ChatCompletionsOutput {
                 mut text,
+                reasoning_content,
                 tool_calls,
                 ..
             } = ret;
             if !text.is_empty() {
                 if extract_code {
-                    text = extract_code_block(&strip_think_tag(&text)).to_string();
+                    text = extract_code_block(&text).to_string();
                 }
                 if print {
                     client.global_config().read().print_markdown(&text)?;
                 }
             }
-            Ok((text, eval_tool_calls(client.global_config(), tool_calls)?))
+            Ok((
+                text,
+                reasoning_content,
+                eval_tool_calls(client.global_config(), tool_calls, abort_signal).await?,
+            ))
         }
         Err(err) => Err(err),
     }
@@ -442,7 +452,7 @@ pub async fn call_chat_completions_streaming(
     input: &Input,
     client: &dyn Client,
     abort_signal: AbortSignal,
-) -> Result<(String, Vec<ToolResult>)> {
+) -> Result<(String, Option<String>, Vec<ToolResult>)> {
     let (tx, rx) = unbounded_channel();
     let mut handler = SseHandler::new(tx, abort_signal.clone());
 
@@ -457,13 +467,17 @@ pub async fn call_chat_completions_streaming(
 
     render_ret?;
 
-    let (text, tool_calls) = handler.take();
+    let (text, reasoning_content, tool_calls) = handler.take();
     match send_ret {
         Ok(_) => {
             if !text.is_empty() && !text.ends_with('\n') {
                 println!();
             }
-            Ok((text, eval_tool_calls(client.global_config(), tool_calls)?))
+            Ok((
+                text,
+                reasoning_content,
+                eval_tool_calls(client.global_config(), tool_calls, abort_signal).await?,
+            ))
         }
         Err(err) => {
             if !text.is_empty() {

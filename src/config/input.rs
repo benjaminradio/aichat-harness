@@ -2,9 +2,9 @@ use super::*;
 
 use crate::client::{
     init_client, patch_messages, ChatCompletionsData, Client, ImageUrl, Message, MessageContent,
-    MessageContentPart, MessageContentToolCalls, MessageRole, Model,
+    MessageContentPart, Model,
 };
-use crate::function::ToolResult;
+use crate::function::{ToolCall, ToolResult};
 use crate::utils::{base64_encode, is_loader_protocol, sha256, AbortSignal};
 
 use anyhow::{bail, Context, Result};
@@ -26,7 +26,7 @@ pub struct Input {
     regenerate: bool,
     medias: Vec<String>,
     data_urls: HashMap<String, String>,
-    tool_calls: Option<MessageContentToolCalls>,
+    pending_messages: Vec<Message>,
     role: Role,
     rag_name: Option<String>,
     with_session: bool,
@@ -46,7 +46,7 @@ impl Input {
             regenerate: false,
             medias: Default::default(),
             data_urls: Default::default(),
-            tool_calls: None,
+            pending_messages: Vec::new(),
             role,
             rag_name: None,
             with_session,
@@ -113,7 +113,7 @@ impl Input {
             regenerate: false,
             medias,
             data_urls,
-            tool_calls: Default::default(),
+            pending_messages: Vec::new(),
             role,
             rag_name: None,
             with_session,
@@ -144,8 +144,8 @@ impl Input {
         self.data_urls.clone()
     }
 
-    pub fn tool_calls(&self) -> &Option<MessageContentToolCalls> {
-        &self.tool_calls
+    pub fn pending_messages(&self) -> &[Message] {
+        &self.pending_messages
     }
 
     pub fn text(&self) -> String {
@@ -189,14 +189,14 @@ impl Input {
             self.role = role;
         }
         self.regenerate = true;
-        self.tool_calls = None;
+        self.pending_messages.clear();
     }
 
     pub async fn use_embeddings(&mut self, abort_signal: AbortSignal) -> Result<()> {
         if self.text.is_empty() {
             return Ok(());
         }
-        let rag = self.config.read().rag.clone();
+        let rag = self.config.read().extract_role().rag();
         if let Some(rag) = rag {
             let result = Config::search_rag(&self.config, &rag, &self.text, abort_signal).await?;
             self.patched_text = Some(result);
@@ -209,12 +209,28 @@ impl Input {
         self.rag_name.as_deref()
     }
 
-    pub fn merge_tool_results(mut self, output: String, tool_results: Vec<ToolResult>) -> Self {
-        match self.tool_calls.as_mut() {
-            Some(exist_tool_results) => {
-                exist_tool_results.merge(tool_results, output);
-            }
-            None => self.tool_calls = Some(MessageContentToolCalls::new(tool_results, output)),
+    pub fn merge_tool_results(
+        mut self,
+        output: String,
+        reasoning_content: Option<String>,
+        tool_results: Vec<ToolResult>,
+    ) -> Self {
+        let tool_calls: Vec<ToolCall> = tool_results.iter().map(|v| v.call.clone()).collect();
+        self.pending_messages.push(Message::new_assistant_tool_calls(
+            output,
+            tool_calls,
+            reasoning_content,
+        ));
+        for result in tool_results {
+            let content = match &result.output {
+                serde_json::Value::String(v) => v.clone(),
+                v => v.to_string(),
+            };
+            self.pending_messages.push(Message::new_tool_result(
+                result.call.id.clone(),
+                content,
+                result.trace,
+            ));
         }
         self
     }
@@ -226,7 +242,6 @@ impl Input {
     pub async fn fetch_chat_text(&self) -> Result<String> {
         let client = self.create_client()?;
         let text = client.chat_completions(self.clone()).await?.text;
-        let text = strip_think_tag(&text).to_string();
         Ok(text)
     }
 
@@ -255,11 +270,8 @@ impl Input {
         } else {
             self.role().build_messages(self)
         };
-        if let Some(tool_calls) = &self.tool_calls {
-            messages.push(Message::new(
-                MessageRole::Assistant,
-                MessageContent::ToolCalls(tool_calls.clone()),
-            ))
+        if !self.pending_messages.is_empty() {
+            messages.extend(self.pending_messages.iter().cloned());
         }
         Ok(messages)
     }

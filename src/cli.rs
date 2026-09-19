@@ -27,6 +27,9 @@ pub struct Cli {
     /// Start a agent
     #[clap(short = 'a', long)]
     pub agent: Option<String>,
+    /// Wrap the session in harness mode, optionally activating an agent
+    #[clap(short = 'H', long)]
+    pub harness: Option<Option<String>>,
     /// Set agent variables
     #[clap(long, value_names = ["NAME", "VALUE"], num_args = 2)]
     pub agent_variable: Vec<String>,

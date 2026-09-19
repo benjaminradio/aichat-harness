@@ -298,6 +298,7 @@ fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsO
     }
     let output = ChatCompletionsOutput {
         text,
+        reasoning_content: None,
         tool_calls,
         id: None,
         input_tokens: data["usageMetadata"]["promptTokenCount"].as_u64(),
@@ -321,64 +322,92 @@ pub fn gemini_build_chat_completions_body(
     let system_message = extract_system_message(&mut messages);
 
     let mut network_image_urls = vec![];
-    let contents: Vec<Value> = messages
-        .into_iter()
-        .flat_map(|message| {
-            let Message { role, content } = message;
+    let mut contents: Vec<Value> = vec![];
+    let mut iter = messages.into_iter().peekable();
+    while let Some(message) = iter.next() {
+        let Message {
+            role,
+            content,
+            tool_calls,
+            ..
+        } = message;
+        if let Some(tool_calls) = tool_calls {
+            // Gemini, like Bedrock/Claude, has no "tool" role: functionCall parts go
+            // out in one "model" turn and the matching functionResponse parts for
+            // that same round go out in one "function" turn. Each round in
+            // `pending_messages` is exactly [Assistant(tool_calls), Tool, Tool, ...],
+            // so gathering the immediately-following Tool-role messages here
+            // reconstructs that round boundary correctly even across multiple
+            // rounds of calls.
+            let model_parts: Vec<Value> = tool_calls
+                .iter()
+                .map(|call| {
+                    json!({
+                        "functionCall": {
+                            "name": call.name,
+                            "args": call.arguments,
+                        }
+                    })
+                })
+                .collect();
+            contents.push(json!({ "role": "model", "parts": model_parts }));
+
+            let mut function_parts = vec![];
+            while let Some(next) = iter.peek() {
+                if !next.role.is_tool() {
+                    break;
+                }
+                let next = iter.next().expect("peeked Some above");
+                // Recover the originating call's name: Gemini's functionResponse
+                // wants it, but it's not stored on the Tool-role message itself
+                // (only tool_call_id is) — match it back up against this round's
+                // calls by position.
+                let name = tool_calls
+                    .iter()
+                    .find(|v| v.id == next.tool_call_id)
+                    .map(|v| v.name.clone())
+                    .unwrap_or_default();
+                function_parts.push(json!({
+                    "functionResponse": {
+                        "name": name,
+                        "response": {
+                            "name": name,
+                            "content": next.content.to_text(),
+                        }
+                    }
+                }));
+            }
+            contents.push(json!({ "role": "function", "parts": function_parts }));
+        } else {
             let role = match role {
                 MessageRole::User => "user",
                 _ => "model",
             };
-               match content {
-                    MessageContent::Text(text) => vec![json!({
-                        "role": role,
-                        "parts": [{ "text": text }]
-                    })],
-                    MessageContent::Array(list) => {
-                        let parts: Vec<Value> = list
-                            .into_iter()
-                            .map(|item| match item {
-                                MessageContentPart::Text { text } => json!({"text": text}),
-                                MessageContentPart::ImageUrl { image_url: ImageUrl { url } } => {
-                                    if let Some((mime_type, data)) = url.strip_prefix("data:").and_then(|v| v.split_once(";base64,")) {
-                                        json!({ "inline_data": { "mime_type": mime_type, "data": data } })
-                                    } else {
-                                        network_image_urls.push(url.clone());
-                                        json!({ "url": url })
-                                    }
-                                },
-                            })
-                            .collect();
-                        vec![json!({ "role": role, "parts": parts })]
-                    },
-                    MessageContent::ToolCalls(MessageContentToolCalls { tool_results, .. }) => {
-                        let model_parts: Vec<Value> = tool_results.iter().map(|tool_result| {
-                            json!({
-                                "functionCall": {
-                                    "name": tool_result.call.name,
-                                    "args": tool_result.call.arguments,
+            match content {
+                MessageContent::Text(text) => contents.push(json!({
+                    "role": role,
+                    "parts": [{ "text": text }]
+                })),
+                MessageContent::Array(list) => {
+                    let parts: Vec<Value> = list
+                        .into_iter()
+                        .map(|item| match item {
+                            MessageContentPart::Text { text } => json!({"text": text}),
+                            MessageContentPart::ImageUrl { image_url: ImageUrl { url } } => {
+                                if let Some((mime_type, data)) = url.strip_prefix("data:").and_then(|v| v.split_once(";base64,")) {
+                                    json!({ "inline_data": { "mime_type": mime_type, "data": data } })
+                                } else {
+                                    network_image_urls.push(url.clone());
+                                    json!({ "url": url })
                                 }
-                            })
-                        }).collect();
-                        let function_parts: Vec<Value> = tool_results.into_iter().map(|tool_result| {
-                            json!({
-                                "functionResponse": {
-                                    "name": tool_result.call.name,
-                                    "response": {
-                                        "name": tool_result.call.name,
-                                        "content": tool_result.output,
-                                    }
-                                }
-                            })
-                        }).collect();
-                        vec![
-                            json!({ "role": "model", "parts": model_parts }),
-                            json!({ "role": "function", "parts": function_parts }),
-                        ]
-                    }
-                }
-        })
-        .collect();
+                            },
+                        })
+                        .collect();
+                    contents.push(json!({ "role": role, "parts": parts }));
+                },
+            }
+        }
+    }
 
     if !network_image_urls.is_empty() {
         bail!(

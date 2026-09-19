@@ -1,7 +1,5 @@
 use super::*;
 
-use crate::utils::strip_think_tag;
-
 use anyhow::{bail, Context, Result};
 use reqwest::RequestBuilder;
 use serde::Deserialize;
@@ -106,7 +104,6 @@ pub async fn openai_chat_completions_streaming(
     let mut function_name = String::new();
     let mut function_arguments = String::new();
     let mut function_id = String::new();
-    let mut reasoning_state = 0;
     let handle = |message: SseMmessage| -> Result<bool> {
         if message.data == "[DONE]" {
             if !function_name.is_empty() {
@@ -130,21 +127,13 @@ pub async fn openai_chat_completions_streaming(
             .as_str()
             .filter(|v| !v.is_empty())
         {
-            if reasoning_state == 1 {
-                handler.text("\n</think>\n\n")?;
-                reasoning_state = 0;
-            }
             handler.text(text)?;
         } else if let Some(text) = data["choices"][0]["delta"]["reasoning_content"]
             .as_str()
             .or_else(|| data["choices"][0]["delta"]["reasoning"].as_str())
             .filter(|v| !v.is_empty())
         {
-            if reasoning_state == 0 {
-                handler.text("<think>\n")?;
-                reasoning_state = 1;
-            }
-            handler.text(text)?;
+            handler.reasoning(text)?;
         }
         if let (Some(function), index, id) = (
             data["choices"][0]["delta"]["tool_calls"][0]["function"].as_object(),
@@ -153,10 +142,6 @@ pub async fn openai_chat_completions_streaming(
                 .as_str()
                 .filter(|v| !v.is_empty()),
         ) {
-            if reasoning_state == 1 {
-                handler.text("\n</think>\n\n")?;
-                reasoning_state = 0;
-            }
             let maybe_call_id = format!("{}/{}", id.unwrap_or_default(), index.unwrap_or_default());
             if maybe_call_id != call_id && maybe_call_id.len() >= call_id.len() {
                 if !function_name.is_empty() {
@@ -232,74 +217,59 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
         stream,
     } = data;
 
-    let messages_len = messages.len();
     let messages: Vec<Value> = messages
         .into_iter()
-        .enumerate()
-        .flat_map(|(i, message)| {
-            let Message { role, content } = message;
-            match content {
-                MessageContent::ToolCalls(MessageContentToolCalls {
-                    tool_results,
-                    text: _,
-                    sequence,
-                }) => {
-                    if !sequence {
-                        let tool_calls: Vec<_> = tool_results
-                            .iter()
-                            .map(|tool_result| {
-                                json!({
-                                    "id": tool_result.call.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tool_result.call.name,
-                                        "arguments": tool_result.call.arguments.to_string(),
-                                    },
-                                })
-                            })
-                            .collect();
-                        let mut messages = vec![
-                            json!({ "role": MessageRole::Assistant, "tool_calls": tool_calls }),
-                        ];
-                        for tool_result in tool_results {
-                            messages.push(json!({
-                                "role": "tool",
-                                "content": tool_result.output.to_string(),
-                                "tool_call_id": tool_result.call.id,
-                            }));
-                        }
-                        messages
-                    } else {
-                        tool_results.into_iter().flat_map(|tool_result| {
-                            vec![
-                                json!({
-                                    "role": MessageRole::Assistant,
-                                    "tool_calls": [
-                                        {
-                                            "id": tool_result.call.id,
-                                            "type": "function",
-                                            "function": {
-                                                "name": tool_result.call.name,
-                                                "arguments": tool_result.call.arguments.to_string(),
-                                            },
-                                        }
-                                    ]
-                                }),
-                                json!({
-                                    "role": "tool",
-                                    "content": tool_result.output.to_string(),
-                                    "tool_call_id": tool_result.call.id,
-                                })
-                            ]
-
-                        }).collect()
-                    }
+        .flat_map(|message| {
+            let Message {
+                role,
+                content,
+                tool_calls,
+                tool_call_id,
+                reasoning_content,
+                ..
+            } = message;
+            if let Some(tool_calls) = tool_calls {
+                let tool_calls_json: Vec<_> = tool_calls
+                    .iter()
+                    .map(|call| {
+                        json!({
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": call.arguments.to_string(),
+                            },
+                        })
+                    })
+                    .collect();
+                let mut message = json!({ "role": role, "tool_calls": tool_calls_json });
+                let text = content.to_text();
+                if !text.is_empty() {
+                    message["content"] = text.into();
                 }
-                MessageContent::Text(text) if role.is_assistant() && i != messages_len - 1 => {
-                    vec![json!({ "role": role, "content": strip_think_tag(&text) }
-                    )]
+                // Preserve reasoning across tool-calling turns for OpenAI-compatible
+                // reasoning models (e.g. Qwen served via vLLM/SGLang), which expect
+                // reasoning_content echoed back on the assistant message it belongs
+                // to, not stripped. Claude/Bedrock/Gemini are deliberately not given
+                // the same treatment here — their reasoning/thinking blocks have
+                // provider-specific signature/redaction requirements that resending
+                // raw text wouldn't satisfy; see each provider's own request builder.
+                if let Some(reasoning_content) = reasoning_content {
+                    message["reasoning_content"] = reasoning_content.into();
                 }
-                _ => vec![json!({ "role": role, "content": content })],
+                vec![message]
+            } else if role.is_tool() {
+                vec![json!({
+                    "role": "tool",
+                    "content": content,
+                    "tool_call_id": tool_call_id,
+                })]
+            } else {
+                let mut message = json!({ "role": role, "content": content });
+                if let Some(reasoning_content) = reasoning_content {
+                    message["reasoning_content"] = reasoning_content.into();
+                }
+                vec![message]
             }
         })
         .collect();
@@ -384,13 +354,14 @@ pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
     if text.is_empty() && tool_calls.is_empty() {
         bail!("Invalid response data: {data}");
     }
-    let text = if !reasoning.is_empty() {
-        format!("<think>\n{reasoning}\n</think>\n\n{text}")
+    let reasoning_content = if reasoning.is_empty() {
+        None
     } else {
-        text.to_string()
+        Some(reasoning.to_string())
     };
     let output = ChatCompletionsOutput {
-        text,
+        text: text.to_string(),
+        reasoning_content,
         tool_calls,
         id: data["id"].as_str().map(|v| v.to_string()),
         input_tokens: data["usage"]["prompt_tokens"].as_u64(),

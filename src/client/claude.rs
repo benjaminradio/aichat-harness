@@ -1,7 +1,5 @@
 use super::*;
 
-use crate::utils::strip_think_tag;
-
 use anyhow::{bail, Context, Result};
 use reqwest::RequestBuilder;
 use serde::Deserialize;
@@ -80,7 +78,6 @@ pub async fn claude_chat_completions_streaming(
     let mut function_name = String::new();
     let mut function_arguments = String::new();
     let mut function_id = String::new();
-    let mut reasoning_state = 0;
     let handle = |message: SseMmessage| -> Result<bool> {
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
@@ -112,11 +109,7 @@ pub async fn claude_chat_completions_streaming(
                     if let Some(text) = data["delta"]["text"].as_str() {
                         handler.text(text)?;
                     } else if let Some(text) = data["delta"]["thinking"].as_str() {
-                        if reasoning_state == 0 {
-                            handler.text("<think>\n")?;
-                            reasoning_state = 1;
-                        }
-                        handler.text(text)?;
+                        handler.reasoning(text)?;
                     } else if let (true, Some(partial_json)) = (
                         !function_name.is_empty(),
                         data["delta"]["partial_json"].as_str(),
@@ -125,10 +118,6 @@ pub async fn claude_chat_completions_streaming(
                     }
                 }
                 "content_block_stop" => {
-                    if reasoning_state == 1 {
-                        handler.text("\n</think>\n\n")?;
-                        reasoning_state = 0;
-                    }
                     if !function_name.is_empty() {
                         let arguments: Value = if function_arguments.is_empty() {
                             json!({})
@@ -169,20 +158,65 @@ pub fn claude_build_chat_completions_body(
 
     let mut network_image_urls = vec![];
 
-    let messages_len = messages.len();
-    let messages: Vec<Value> = messages
-        .into_iter()
-        .enumerate()
-        .flat_map(|(i, message)| {
-            let Message { role, content } = message;
-            match content {
-                MessageContent::Text(text) if role.is_assistant() && i != messages_len - 1 => {
-                    vec![json!({ "role": role, "content": strip_think_tag(&text) })]
+    let mut messages_out: Vec<Value> = vec![];
+    let mut iter = messages.into_iter().peekable();
+    while let Some(message) = iter.next() {
+        let Message {
+            role,
+            content,
+            tool_calls,
+            ..
+        } = message;
+        if let Some(tool_calls) = tool_calls {
+            // Claude, like Bedrock, has no "tool" role: tool_use blocks go out in one
+            // "assistant" message and the matching tool_result blocks for that same
+            // round go out in one "user" message. Each round in `pending_messages`
+            // is exactly [Assistant(tool_calls), Tool, Tool, ...], so gathering the
+            // immediately-following Tool-role messages here reconstructs that round
+            // boundary correctly even across multiple rounds of calls.
+            let mut assistant_parts = vec![];
+            let text = content.to_text();
+            if !text.is_empty() {
+                assistant_parts.push(json!({
+                    "type": "text",
+                    "text": text,
+                }));
+            }
+            for call in &tool_calls {
+                assistant_parts.push(json!({
+                    "type": "tool_use",
+                    "id": call.id,
+                    "name": call.name,
+                    "input": call.arguments,
+                }));
+            }
+            messages_out.push(json!({
+                "role": "assistant",
+                "content": assistant_parts,
+            }));
+
+            let mut user_parts = vec![];
+            while let Some(next) = iter.peek() {
+                if !next.role.is_tool() {
+                    break;
                 }
-                MessageContent::Text(text) => vec![json!({
+                let next = iter.next().expect("peeked Some above");
+                user_parts.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": next.tool_call_id,
+                    "content": next.content.to_text(),
+                }));
+            }
+            messages_out.push(json!({
+                "role": "user",
+                "content": user_parts,
+            }));
+        } else {
+            match content {
+                MessageContent::Text(text) => messages_out.push(json!({
                     "role": role,
                     "content": text,
-                })],
+                })),
                 MessageContent::Array(list) => {
                     let content: Vec<_> = list
                         .into_iter()
@@ -212,49 +246,15 @@ pub fn claude_build_chat_completions_body(
                             }
                         })
                         .collect();
-                    vec![json!({
+                    messages_out.push(json!({
                         "role": role,
                         "content": content,
-                    })]
-                }
-                MessageContent::ToolCalls(MessageContentToolCalls {
-                    tool_results, text, ..
-                }) => {
-                    let mut assistant_parts = vec![];
-                    let mut user_parts = vec![];
-                    if !text.is_empty() {
-                        assistant_parts.push(json!({
-                            "type": "text",
-                            "text": text,
-                        }))
-                    }
-                    for tool_result in tool_results {
-                        assistant_parts.push(json!({
-                            "type": "tool_use",
-                            "id": tool_result.call.id,
-                            "name": tool_result.call.name,
-                            "input": tool_result.call.arguments,
-                        }));
-                        user_parts.push(json!({
-                            "type": "tool_result",
-                            "tool_use_id": tool_result.call.id,
-                            "content": tool_result.output.to_string(),
-                        }));
-                    }
-                    vec![
-                        json!({
-                            "role": "assistant",
-                            "content": assistant_parts,
-                        }),
-                        json!({
-                            "role": "user",
-                            "content": user_parts,
-                        }),
-                    ]
+                    }));
                 }
             }
-        })
-        .collect();
+        }
+    }
+    let messages = messages_out;
 
     if !network_image_urls.is_empty() {
         bail!(
@@ -334,16 +334,13 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
             }
         }
     }
-    if let Some(reasoning) = reasoning {
-        text = format!("<think>\n{reasoning}\n</think>\n\n{text}")
-    }
-
     if text.is_empty() && tool_calls.is_empty() {
         bail!("Invalid response data: {data}");
     }
 
     let output = ChatCompletionsOutput {
         text: text.to_string(),
+        reasoning_content: reasoning,
         tool_calls,
         id: data["id"].as_str().map(|v| v.to_string()),
         input_tokens: data["usage"]["input_tokens"].as_u64(),

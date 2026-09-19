@@ -1,27 +1,76 @@
 use super::Model;
 
-use crate::{function::ToolResult, multiline_text, utils::dimmed_text};
+use crate::function::ToolCall;
+use crate::multiline_text;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Message {
     pub role: MessageRole,
     pub content: MessageContent,
-}
-
-impl Default for Message {
-    fn default() -> Self {
-        Self {
-            role: MessageRole::User,
-            content: MessageContent::Text(String::new()),
-        }
-    }
+    /// Present only on Assistant messages that made tool calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Present only on Tool messages; pairs the result back to the originating call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Present only on Tool messages. Rich supplementary detail that should be
+    /// logged/displayed but never sent back to the model — `content` is always the
+    /// terse result the model actually sees. Generic `Value` so other tools can use
+    /// it later; today only `spawn_subagent` populates it, with the subagent's full
+    /// internal message trace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace: Option<serde_json::Value>,
+    /// Present only on Assistant messages. Split out of `content` so reasoning never
+    /// lives in a string a provider might re-parse or re-send — see
+    /// `render::format_reasoning` for the `<think>` display-time wrapping this
+    /// replaces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 impl Message {
     pub fn new(role: MessageRole, content: MessageContent) -> Self {
-        Self { role, content }
+        Self {
+            role,
+            content,
+            ..Default::default()
+        }
+    }
+
+    /// Build the Assistant message for one tool-calling round.
+    pub fn new_assistant_tool_calls(
+        text: String,
+        tool_calls: Vec<ToolCall>,
+        reasoning_content: Option<String>,
+    ) -> Self {
+        Self {
+            role: MessageRole::Assistant,
+            content: MessageContent::Text(text),
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
+            },
+            reasoning_content,
+            ..Default::default()
+        }
+    }
+
+    /// Build one Tool-role result message, pairing back to `call_id`.
+    pub fn new_tool_result(
+        call_id: Option<String>,
+        content: String,
+        trace: Option<serde_json::Value>,
+    ) -> Self {
+        Self {
+            role: MessageRole::Tool,
+            content: MessageContent::Text(content),
+            tool_call_id: call_id,
+            trace,
+            ..Default::default()
+        }
     }
 
     pub fn merge_system(&mut self, system: MessageContent) {
@@ -47,16 +96,16 @@ impl Message {
                 system_list.append(list);
                 self.content = MessageContent::Array(system_list);
             }
-            _ => {}
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
     System,
     Assistant,
+    #[default]
     User,
     Tool,
 }
@@ -74,6 +123,10 @@ impl MessageRole {
     pub fn is_assistant(&self) -> bool {
         matches!(self, MessageRole::Assistant)
     }
+
+    pub fn is_tool(&self) -> bool {
+        matches!(self, MessageRole::Tool)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -81,15 +134,19 @@ impl MessageRole {
 pub enum MessageContent {
     Text(String),
     Array(Vec<MessageContentPart>),
-    // Note: This type is primarily for convenience and does not exist in OpenAI's API.
-    ToolCalls(MessageContentToolCalls),
+}
+
+impl Default for MessageContent {
+    fn default() -> Self {
+        MessageContent::Text(String::new())
+    }
 }
 
 impl MessageContent {
     pub fn render_input(
         &self,
         resolve_url_fn: impl Fn(&str) -> String,
-        agent_info: &Option<(String, Vec<String>)>,
+        _agent_info: &Option<(String, Vec<String>)>,
     ) -> String {
         match self {
             MessageContent::Text(text) => multiline_text(text),
@@ -110,26 +167,6 @@ impl MessageContent {
                 }
                 format!(".file {}{}", files.join(" "), concated_text)
             }
-            MessageContent::ToolCalls(MessageContentToolCalls {
-                tool_results, text, ..
-            }) => {
-                let mut lines = vec![];
-                if !text.is_empty() {
-                    lines.push(text.clone())
-                }
-                for tool_result in tool_results {
-                    let mut parts = vec!["Call".to_string()];
-                    if let Some((agent_name, functions)) = agent_info {
-                        if functions.contains(&tool_result.call.name) {
-                            parts.push(agent_name.clone())
-                        }
-                    }
-                    parts.push(tool_result.call.name.clone());
-                    parts.push(tool_result.call.arguments.to_string());
-                    lines.push(dimmed_text(&parts.join(" ")));
-                }
-                lines.join("\n")
-            }
         }
     }
 
@@ -145,7 +182,6 @@ impl MessageContent {
                     *text = replace_fn(text)
                 }
             }
-            MessageContent::ToolCalls(_) => {}
         }
     }
 
@@ -161,7 +197,6 @@ impl MessageContent {
                 }
                 parts.join("\n\n")
             }
-            MessageContent::ToolCalls(_) => String::new(),
         }
     }
 }
@@ -178,29 +213,6 @@ pub struct ImageUrl {
     pub url: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct MessageContentToolCalls {
-    pub tool_results: Vec<ToolResult>,
-    pub text: String,
-    pub sequence: bool,
-}
-
-impl MessageContentToolCalls {
-    pub fn new(tool_results: Vec<ToolResult>, text: String) -> Self {
-        Self {
-            tool_results,
-            text,
-            sequence: false,
-        }
-    }
-
-    pub fn merge(&mut self, tool_results: Vec<ToolResult>, _text: String) {
-        self.tool_results.extend(tool_results);
-        self.text.clear();
-        self.sequence = true;
-    }
-}
-
 pub fn patch_messages(messages: &mut Vec<Message>, model: &Model) {
     if messages.is_empty() {
         return;
@@ -214,6 +226,7 @@ pub fn patch_messages(messages: &mut Vec<Message>, model: &Model) {
                 Message {
                     role: MessageRole::System,
                     content: MessageContent::Text(prefix.to_string()),
+                    ..Default::default()
                 },
             );
         }

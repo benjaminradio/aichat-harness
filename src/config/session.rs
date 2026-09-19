@@ -20,12 +20,8 @@ static RE_AUTONAME_PREFIX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{8}
 pub struct Session {
     #[serde(rename(serialize = "model", deserialize = "model"))]
     model_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    use_tools: Option<String>,
+    #[serde(flatten)]
+    settings: RoleSettings,
     #[serde(skip_serializing_if = "Option::is_none")]
     save_session: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -46,6 +42,8 @@ pub struct Session {
 
     #[serde(skip)]
     model: Model,
+    #[serde(skip)]
+    rag: Option<Arc<Rag>>,
     #[serde(skip)]
     role_prompt: String,
     #[serde(skip)]
@@ -234,8 +232,32 @@ impl Session {
                         );
                     }
                     MessageRole::Assistant => {
+                        if let Some(reasoning) = &message.reasoning_content {
+                            let text = format_reasoning(reasoning);
+                            if !text.is_empty() {
+                                lines.push(render.render(&text));
+                            }
+                        }
                         if let MessageContent::Text(text) = &message.content {
-                            lines.push(render.render(text));
+                            if !text.is_empty() {
+                                lines.push(render.render(text));
+                            }
+                        }
+                        if let Some(tool_calls) = &message.tool_calls {
+                            for call in tool_calls {
+                                let name = match agent_info {
+                                    Some((agent_name, functions))
+                                        if functions.contains(&call.name) =>
+                                    {
+                                        format!("{agent_name}-{}", call.name)
+                                    }
+                                    _ => call.name.clone(),
+                                };
+                                lines.push(dimmed_text(&format!(
+                                    "Call {name} {}",
+                                    call.arguments
+                                )));
+                            }
                         }
                         lines.push("".into());
                     }
@@ -246,7 +268,8 @@ impl Session {
                         ));
                     }
                     MessageRole::Tool => {
-                        lines.push(message.content.render_input(resolve_url_fn, agent_info));
+                        let text = message.content.to_text();
+                        lines.push(format_subagent_trace(message.trace.as_ref(), &text));
                     }
                 }
             }
@@ -269,10 +292,14 @@ impl Session {
 
     pub fn set_role(&mut self, role: Role) {
         self.model_id = role.model().id();
-        self.temperature = role.temperature();
-        self.top_p = role.top_p();
-        self.use_tools = role.use_tools();
+        self.settings.temperature = role.temperature();
+        self.settings.top_p = role.top_p();
+        self.settings.use_tools = role.use_tools();
+        self.settings.use_agents = role.use_agents();
+        self.settings.max_spawn_depth = role.max_spawn_depth();
+        self.settings.max_subagent_turns = role.max_subagent_turns();
         self.model = role.model().clone();
+        self.rag = role.rag();
         self.role_name = convert_option_string(role.name());
         self.role_prompt = role.prompt().to_string();
         self.dirty = true;
@@ -282,13 +309,15 @@ impl Session {
     pub fn clear_role(&mut self) {
         self.role_name = None;
         self.role_prompt.clear();
+        self.rag = None;
     }
 
-    pub fn sync_agent(&mut self, agent: &Agent) {
+    pub fn sync_agent(&mut self, agent: &Role) {
         self.role_name = None;
         self.role_prompt = agent.interpolated_instructions();
         self.agent_variables = agent.variables().clone();
         self.agent_instructions = self.role_prompt.clone();
+        self.rag = agent.rag();
     }
 
     pub fn agent_variables(&self) -> &AgentVariables {
@@ -466,11 +495,19 @@ impl Session {
         Ok(())
     }
 
-    pub fn add_message(&mut self, input: &Input, output: &str) -> Result<()> {
+    pub fn add_message(
+        &mut self,
+        input: &Input,
+        output: &str,
+        reasoning_content: Option<String>,
+    ) -> Result<()> {
         if input.continue_output().is_some() {
             if let Some(message) = self.messages.last_mut() {
                 if let MessageContent::Text(text) = &mut message.content {
                     *text = format!("{text}{output}");
+                }
+                if reasoning_content.is_some() {
+                    message.reasoning_content = reasoning_content;
                 }
             }
         } else if input.regenerate() {
@@ -478,6 +515,7 @@ impl Session {
                 if let MessageContent::Text(text) = &mut message.content {
                     *text = output.to_string();
                 }
+                message.reasoning_content = reasoning_content;
             }
         } else {
             if self.messages.is_empty() {
@@ -492,16 +530,10 @@ impl Session {
                     .push(Message::new(MessageRole::User, input.message_content()));
             }
             self.data_urls.extend(input.data_urls());
-            if let Some(tool_calls) = input.tool_calls() {
-                self.messages.push(Message::new(
-                    MessageRole::Tool,
-                    MessageContent::ToolCalls(tool_calls.clone()),
-                ))
-            }
-            self.messages.push(Message::new(
-                MessageRole::Assistant,
-                MessageContent::Text(output.to_string()),
-            ));
+            self.messages.extend(input.pending_messages().iter().cloned());
+            let mut message = Message::new(MessageRole::Assistant, MessageContent::Text(output.to_string()));
+            message.reasoning_content = reasoning_content;
+            self.messages.push(message);
         }
         self.dirty = true;
         self.update_tokens();
@@ -562,6 +594,7 @@ impl RoleLike for Session {
         let role_name = self.role_name.as_deref().unwrap_or_default();
         let mut role = Role::new(role_name, &self.role_prompt);
         role.sync(self);
+        role.rag = self.rag.clone();
         role
     }
 
@@ -570,15 +603,31 @@ impl RoleLike for Session {
     }
 
     fn temperature(&self) -> Option<f64> {
-        self.temperature
+        self.settings.temperature
     }
 
     fn top_p(&self) -> Option<f64> {
-        self.top_p
+        self.settings.top_p
     }
 
     fn use_tools(&self) -> Option<String> {
-        self.use_tools.clone()
+        self.settings.use_tools.clone()
+    }
+
+    fn use_agents(&self) -> Option<String> {
+        self.settings.use_agents.clone()
+    }
+
+    fn max_spawn_depth(&self) -> Option<usize> {
+        self.settings.max_spawn_depth
+    }
+
+    fn max_subagent_turns(&self) -> Option<usize> {
+        self.settings.max_subagent_turns
+    }
+
+    fn rag(&self) -> Option<Arc<Rag>> {
+        self.rag.clone()
     }
 
     fn set_model(&mut self, model: Model) {
@@ -591,24 +640,50 @@ impl RoleLike for Session {
     }
 
     fn set_temperature(&mut self, value: Option<f64>) {
-        if self.temperature != value {
-            self.temperature = value;
+        if self.settings.temperature != value {
+            self.settings.temperature = value;
             self.dirty = true;
         }
     }
 
     fn set_top_p(&mut self, value: Option<f64>) {
-        if self.top_p != value {
-            self.top_p = value;
+        if self.settings.top_p != value {
+            self.settings.top_p = value;
             self.dirty = true;
         }
     }
 
     fn set_use_tools(&mut self, value: Option<String>) {
-        if self.use_tools != value {
-            self.use_tools = value;
+        if self.settings.use_tools != value {
+            self.settings.use_tools = value;
             self.dirty = true;
         }
+    }
+
+    fn set_use_agents(&mut self, value: Option<String>) {
+        if self.settings.use_agents != value {
+            self.settings.use_agents = value;
+            self.dirty = true;
+        }
+    }
+
+    fn set_max_spawn_depth(&mut self, value: Option<usize>) {
+        if self.settings.max_spawn_depth != value {
+            self.settings.max_spawn_depth = value;
+            self.dirty = true;
+        }
+    }
+
+    fn set_max_subagent_turns(&mut self, value: Option<usize>) {
+        if self.settings.max_subagent_turns != value {
+            self.settings.max_subagent_turns = value;
+            self.dirty = true;
+        }
+    }
+
+    fn set_rag(&mut self, value: Option<Arc<Rag>>) {
+        self.rag = value;
+        self.dirty = true;
     }
 }
 

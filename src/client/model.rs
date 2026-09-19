@@ -1,11 +1,11 @@
 use super::{
     list_all_models, list_client_names,
     message::{Message, MessageContent, MessageContentPart},
-    ApiPatch, MessageContentToolCalls, RequestPatch,
+    ApiPatch, RequestPatch,
 };
 
 use crate::config::Config;
-use crate::utils::{estimate_token_length, strip_think_tag};
+use crate::utils::estimate_token_length;
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -232,38 +232,38 @@ impl Model {
     }
 
     pub fn messages_tokens(&self, messages: &[Message]) -> usize {
-        let messages_len = messages.len();
         messages
             .iter()
-            .enumerate()
-            .map(|(i, v)| match &v.content {
-                MessageContent::Text(text) => {
-                    if v.role.is_assistant() && i != messages_len - 1 {
-                        estimate_token_length(&strip_think_tag(text))
-                    } else {
-                        estimate_token_length(text)
-                    }
+            .map(|v| {
+                let mut tokens = match &v.content {
+                    MessageContent::Text(text) => estimate_token_length(text),
+                    MessageContent::Array(list) => list
+                        .iter()
+                        .map(|v| match v {
+                            MessageContentPart::Text { text } => estimate_token_length(text),
+                            MessageContentPart::ImageUrl { .. } => 0,
+                        })
+                        .sum(),
+                };
+                // reasoning_content is resent on the wire for OpenAI-compatible
+                // reasoning models (see openai.rs's request builder) but not for
+                // Claude/Bedrock/Gemini. Counting it unconditionally here means
+                // slightly overestimating the budget for the providers that don't
+                // resend it, which is the safer direction to be wrong in.
+                if let Some(reasoning_content) = &v.reasoning_content {
+                    tokens += estimate_token_length(reasoning_content);
                 }
-                MessageContent::Array(list) => list
-                    .iter()
-                    .map(|v| match v {
-                        MessageContentPart::Text { text } => estimate_token_length(text),
-                        MessageContentPart::ImageUrl { .. } => 0,
-                    })
-                    .sum(),
-                MessageContent::ToolCalls(MessageContentToolCalls {
-                    tool_results, text, ..
-                }) => {
-                    estimate_token_length(text)
-                        + tool_results
-                            .iter()
-                            .map(|v| {
-                                serde_json::to_string(v)
-                                    .map(|v| estimate_token_length(&v))
-                                    .unwrap_or_default()
-                            })
-                            .sum::<usize>()
+                if let Some(tool_calls) = &v.tool_calls {
+                    tokens += tool_calls
+                        .iter()
+                        .map(|call| {
+                            serde_json::to_string(call)
+                                .map(|v| estimate_token_length(&v))
+                                .unwrap_or_default()
+                        })
+                        .sum::<usize>();
                 }
+                tokens
             })
             .sum()
     }

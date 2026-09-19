@@ -1,16 +1,18 @@
 use crate::{
-    config::{Agent, Config, GlobalConfig},
+    config::{Config, GlobalConfig, Input, Role, RoleLike},
     utils::*,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use indexmap::IndexMap;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 #[cfg(windows)]
@@ -18,7 +20,11 @@ const PATH_SEP: &str = ";";
 #[cfg(not(windows))]
 const PATH_SEP: &str = ":";
 
-pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Result<Vec<ToolResult>> {
+pub async fn eval_tool_calls(
+    config: &GlobalConfig,
+    mut calls: Vec<ToolCall>,
+    abort_signal: AbortSignal,
+) -> Result<Vec<ToolResult>> {
     let mut output = vec![];
     if calls.is_empty() {
         return Ok(output);
@@ -29,13 +35,16 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
     }
     let mut is_all_null = true;
     for call in calls {
-        let mut result = call.eval(config)?;
+        let (mut result, trace) = call.eval(config, abort_signal.clone()).await?;
         if result.is_null() {
             result = json!("DONE");
         } else {
             is_all_null = false;
         }
-        output.push(ToolResult::new(call, result));
+        output.push(match trace {
+            Some(trace) => ToolResult::new_with_trace(call, result, trace),
+            None => ToolResult::new(call, result),
+        });
     }
     if is_all_null {
         output = vec![];
@@ -43,15 +52,31 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
     Ok(output)
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone)]
 pub struct ToolResult {
     pub call: ToolCall,
     pub output: Value,
+    /// Rich supplementary detail that should be persisted and displayed but never
+    /// sent back to the model. Only `spawn_subagent` populates this today (the
+    /// subagent's full internal message trace); everything else leaves it `None`.
+    pub trace: Option<Value>,
 }
 
 impl ToolResult {
     pub fn new(call: ToolCall, output: Value) -> Self {
-        Self { call, output }
+        Self {
+            call,
+            output,
+            trace: None,
+        }
+    }
+
+    pub fn new_with_trace(call: ToolCall, output: Value, trace: Value) -> Self {
+        Self {
+            call,
+            output,
+            trace: Some(trace),
+        }
     }
 }
 
@@ -104,7 +129,7 @@ pub struct FunctionDeclaration {
     pub agent: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct JsonSchema {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub type_value: Option<String>,
@@ -130,6 +155,50 @@ impl JsonSchema {
             Some(v) => v.is_empty(),
             None => true,
         }
+    }
+}
+
+pub const SPAWN_SUBAGENT_TOOL_NAME: &str = "spawn_subagent";
+
+/// The synthetic `spawn_subagent` declaration injected in `select_functions` between
+/// tier 1 (global tools) and tier 2 (agent-declared tools), so that an agent
+/// declaring its own `spawn_subagent` in `functions.json` shadows this one through
+/// the existing name-dedup, with no special-casing.
+pub fn spawn_subagent_declaration(allowed_agents: &[String]) -> FunctionDeclaration {
+    let agent_schema = JsonSchema {
+        type_value: Some("string".into()),
+        description: Some("Name of the agent to run.".into()),
+        // When the allowlist is a concrete set of names (rather than "all"), surface
+        // it as an enum so the model can't invent an agent name that would just fail
+        // the allowlist check at dispatch time.
+        enum_value: if allowed_agents.is_empty() {
+            None
+        } else {
+            Some(allowed_agents.to_vec())
+        },
+        ..Default::default()
+    };
+    let input_schema = JsonSchema {
+        type_value: Some("string".into()),
+        description: Some(
+            "The task to give the subagent. It does not see this conversation, so state the task completely and self-containedly."
+                .into(),
+        ),
+        ..Default::default()
+    };
+    let mut properties = IndexMap::new();
+    properties.insert("agent".to_string(), agent_schema);
+    properties.insert("input".to_string(), input_schema);
+    FunctionDeclaration {
+        name: SPAWN_SUBAGENT_TOOL_NAME.into(),
+        description: "Run a task in an isolated subagent and return its final answer. The subagent starts with no history and cannot see this conversation.".into(),
+        parameters: JsonSchema {
+            type_value: Some("object".into()),
+            properties: Some(properties),
+            required: Some(vec!["agent".into(), "input".into()]),
+            ..Default::default()
+        },
+        agent: false,
     }
 }
 
@@ -170,7 +239,18 @@ impl ToolCall {
         }
     }
 
-    pub fn eval(&self, config: &GlobalConfig) -> Result<Value> {
+    pub async fn eval(
+        &self,
+        config: &GlobalConfig,
+        abort_signal: AbortSignal,
+    ) -> Result<(Value, Option<Value>)> {
+        // Single interception point for non-external-process tool kinds. When a
+        // future Lua-backed kind lands, it becomes a third arm here rather than
+        // another edit to the dispatch below.
+        if self.name == SPAWN_SUBAGENT_TOOL_NAME && !agent_declares_override(config, &self.name) {
+            return self.eval_spawn_subagent(config, abort_signal).await;
+        }
+
         let (call_name, cmd_name, mut cmd_args, envs) = match &config.read().agent {
             Some(agent) => self.extract_call_config_from_agent(config, agent)?,
             None => self.extract_call_config_from_config(config)?,
@@ -199,13 +279,13 @@ impl ToolCall {
             None => Value::Null,
         };
 
-        Ok(output)
+        Ok((output, None))
     }
 
     fn extract_call_config_from_agent(
         &self,
         config: &GlobalConfig,
-        agent: &Agent,
+        agent: &Role,
     ) -> Result<CallConfig> {
         let function_name = self.name.clone();
         match agent.functions().find(&function_name) {
@@ -243,6 +323,137 @@ impl ToolCall {
             false => bail!("Unexpected call: {function_name} {}", self.arguments),
         }
     }
+
+    /// Run a subagent in isolation and return its final assistant text.
+    ///
+    /// Follows `Config::macro_execute`'s existing isolation pattern (clone the whole
+    /// `Config`, reset context fields, drive it under a fresh `Arc<RwLock<Config>>`)
+    /// rather than inventing a new mechanism. Nothing is written back to the parent
+    /// config or its session — the child handle is simply dropped at the end.
+    ///
+    /// `#[async_recursion]` is required, not stylistic: this sits in a genuine async
+    /// cycle (eval → eval_spawn_subagent → run_completion_loop → call_chat_completions
+    /// → eval_tool_calls → eval), which would otherwise be an infinitely-sized future.
+    /// Boxing here is what breaks it.
+    #[async_recursion::async_recursion]
+    async fn eval_spawn_subagent(
+        &self,
+        config: &GlobalConfig,
+        abort_signal: AbortSignal,
+    ) -> Result<(Value, Option<Value>)> {
+        let args = if self.arguments.is_object() {
+            self.arguments.clone()
+        } else if let Some(arguments) = self.arguments.as_str() {
+            serde_json::from_str(arguments)
+                .map_err(|_| anyhow!("The call 'spawn_subagent' has invalid arguments"))?
+        } else {
+            bail!("The call 'spawn_subagent' has invalid arguments");
+        };
+        let agent_name = args
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("spawn_subagent requires an 'agent' argument"))?
+            .to_string();
+        let input_text = args
+            .get("input")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("spawn_subagent requires an 'input' argument"))?
+            .to_string();
+
+        let (parent_role, parent_depth, parent_ceiling, stream) = {
+            let cfg = config.read();
+            (
+                cfg.extract_role(),
+                cfg.agent_depth,
+                cfg.agent_depth_ceiling,
+                cfg.stream,
+            )
+        };
+
+        // Re-check the allowlist at dispatch time. The synthetic declaration already
+        // constrains `agent` to an enum of allowed names, but a model can still emit
+        // anything, and an agent-declared override reaches a different path entirely.
+        let allowed = config.read().allowed_agents(&parent_role);
+        if !allowed.contains(&agent_name) {
+            bail!("Agent '{agent_name}' is not in the allowlist for spawning subagents");
+        }
+        // Defense in depth: select_functions only offers the tool below the ceiling,
+        // but a model may replay a stale call from earlier context.
+        if parent_depth >= config.read().effective_max_spawn_depth(&parent_role) {
+            bail!("Maximum subagent spawn depth reached");
+        }
+
+        let mut child = config.read().clone();
+        child.role = None;
+        child.session = None;
+        child.agent = None;
+        child.harness_active = false;
+        child.harness_activated_agent = false;
+        child.agent_depth = parent_depth + 1;
+        child.agent_depth_ceiling = if parent_ceiling == 0 {
+            usize::MAX
+        } else {
+            parent_ceiling
+        };
+        let child_config: GlobalConfig = Arc::new(RwLock::new(child));
+
+        // force_init_rag: true — a subagent has no interactive terminal to answer the
+        // "init RAG?" confirmation, so build the index rather than silently running
+        // without the documents the agent expects.
+        let agent = Role::load_agent(&child_config, &agent_name, true, abort_signal.clone()).await?;
+        // A subagent may tighten the ceiling for its own descendants, never raise it.
+        {
+            let mut cfg = child_config.write();
+            if let Some(own) = agent.max_spawn_depth() {
+                cfg.agent_depth_ceiling = cfg.agent_depth_ceiling.min(own);
+            }
+            cfg.agent = Some(agent);
+        }
+        child_config.write().init_agent_shared_variables()?;
+
+        let max_turns = child_config
+            .read()
+            .agent
+            .as_ref()
+            .and_then(|v| v.max_subagent_turns());
+
+        let input = Input::from_str(&child_config, &input_text, None);
+
+        // Sequential dispatch within eval_tool_calls guarantees no concurrent
+        // subagent stream can interleave with this one, so plain open/close tags are
+        // unambiguous. Mirrors how reasoning is wrapped in <think> tags.
+        if stream {
+            println!("<subagent agent=\"{agent_name}\">");
+        }
+        let result =
+            crate::harness::run_completion_loop(&child_config, input, false, max_turns, abort_signal)
+                .await;
+        if stream {
+            println!("</subagent>");
+        }
+
+        let outcome = result?;
+        let trace = json!({
+            "agent": agent_name,
+            "messages": outcome.messages,
+        });
+        Ok((json!(outcome.output), Some(trace)))
+    }
+}
+
+/// Whether the active agent declares its own `spawn_subagent` in `functions.json`.
+/// If it does, `select_functions`' tier-2 dedup already shadowed the synthetic
+/// declaration, so the model never saw ours and the call belongs to normal
+/// external-process dispatch.
+fn agent_declares_override(config: &GlobalConfig, name: &str) -> bool {
+    match &config.read().agent {
+        Some(agent) => agent
+            .functions()
+            .declarations()
+            .iter()
+            .any(|v| v.name == name),
+        None => false,
+    }
 }
 
 pub fn run_llm_function(
@@ -254,7 +465,7 @@ pub fn run_llm_function(
 
     let mut bin_dirs: Vec<PathBuf> = vec![];
     if cmd_args.len() > 1 {
-        let dir = Config::agent_functions_dir(&cmd_name).join("bin");
+        let dir = Config::agent_dir(&cmd_name).join("bin");
         if dir.exists() {
             bin_dirs.push(dir);
         }

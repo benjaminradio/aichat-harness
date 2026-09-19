@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::utils::{base64_decode, encode_uri, hex_encode, hmac_sha256, sha256, strip_think_tag};
+use crate::utils::{base64_decode, encode_uri, hex_encode, hmac_sha256, sha256};
 
 use anyhow::{bail, Context, Result};
 use aws_smithy_eventstream::frame::{DecodedFrame, MessageFrameDecoder};
@@ -204,7 +204,6 @@ async fn chat_completions_streaming(
     let mut function_name = String::new();
     let mut function_arguments = String::new();
     let mut function_id = String::new();
-    let mut reasoning_state = 0;
 
     let mut stream = res.bytes_stream();
     let mut buffer = BytesMut::new();
@@ -253,20 +252,12 @@ async fn chat_completions_streaming(
                             } else if let Some(text) =
                                 data["delta"]["reasoningContent"]["text"].as_str()
                             {
-                                if reasoning_state == 0 {
-                                    handler.text("<think>\n")?;
-                                    reasoning_state = 1;
-                                }
-                                handler.text(text)?;
+                                handler.reasoning(text)?;
                             } else if let Some(input) = data["delta"]["toolUse"]["input"].as_str() {
                                 function_arguments.push_str(input);
                             }
                         }
                         "contentBlockStop" => {
-                            if reasoning_state == 1 {
-                                handler.text("\n</think>\n\n")?;
-                                reasoning_state = 0;
-                            }
                             if !function_name.is_empty() {
                                 if function_arguments.is_empty() {
                                     function_arguments = String::from("{}");
@@ -331,24 +322,74 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
 
     let mut network_image_urls = vec![];
 
-    let messages_len = messages.len();
-    let messages: Vec<Value> = messages
-        .into_iter()
-        .enumerate()
-        .flat_map(|(i, message)| {
-            let Message { role, content } = message;
-            match content {
-                MessageContent::Text(text) if role.is_assistant() && i != messages_len - 1 => {
-                    vec![json!({ "role": role, "content": [ { "text": strip_think_tag(&text) } ] })]
+    let mut messages_out: Vec<Value> = vec![];
+    let mut iter = messages.into_iter().peekable();
+    while let Some(message) = iter.next() {
+        let Message {
+            role,
+            content,
+            tool_calls,
+            ..
+        } = message;
+        if let Some(tool_calls) = tool_calls {
+            // Bedrock's Converse API has no "tool" role: the assistant's toolUse
+            // blocks go out as one "assistant" message, and the corresponding
+            // toolResult blocks for *that same round* go out as one "user" message.
+            // Each round in `pending_messages` is exactly
+            // [Assistant(tool_calls), Tool, Tool, ...], so gathering the
+            // immediately-following Tool-role messages here reconstructs that
+            // round boundary correctly even across multiple rounds of calls.
+            let mut assistant_parts = vec![];
+            let text = content.to_text();
+            if !text.is_empty() {
+                assistant_parts.push(json!({ "text": text }));
+            }
+            for call in &tool_calls {
+                assistant_parts.push(json!({
+                    "toolUse": {
+                        "toolUseId": call.id,
+                        "name": call.name,
+                        "input": call.arguments,
+                    }
+                }));
+            }
+            messages_out.push(json!({
+                "role": "assistant",
+                "content": assistant_parts,
+            }));
+
+            let mut user_parts = vec![];
+            while let Some(next) = iter.peek() {
+                if !next.role.is_tool() {
+                    break;
                 }
-                MessageContent::Text(text) => vec![json!({
+                let next = iter.next().expect("peeked Some above");
+                let output = parse_tool_result_content(&next.content.to_text());
+                user_parts.push(json!({
+                    "toolResult": {
+                        "toolUseId": next.tool_call_id,
+                        "content": [
+                            {
+                                "json": output,
+                            }
+                        ]
+                    }
+                }));
+            }
+            messages_out.push(json!({
+                "role": "user",
+                "content": user_parts,
+            }));
+        } else {
+            match content {
+                MessageContent::Text(text) => messages_out.push(json!({
                     "role": role,
                     "content": [
                         {
                             "text": text,
                         }
                     ],
-                })],
+                })),
                 MessageContent::Array(list) => {
                     let content: Vec<_> = list
                         .into_iter()
@@ -378,54 +419,15 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
                             }
                         })
                         .collect();
-                    vec![json!({
+                    messages_out.push(json!({
                         "role": role,
                         "content": content,
-                    })]
-                }
-                MessageContent::ToolCalls(MessageContentToolCalls {
-                    tool_results, text, ..
-                }) => {
-                    let mut assistant_parts = vec![];
-                    let mut user_parts = vec![];
-                    if !text.is_empty() {
-                        assistant_parts.push(json!({
-                            "text": text,
-                        }))
-                    }
-                    for tool_result in tool_results {
-                        assistant_parts.push(json!({
-                            "toolUse": {
-                                "toolUseId": tool_result.call.id,
-                                "name": tool_result.call.name,
-                                "input": tool_result.call.arguments,
-                            }
-                        }));
-                        user_parts.push(json!({
-                            "toolResult": {
-                                "toolUseId": tool_result.call.id,
-                                "content": [
-                                    {
-                                        "json": tool_result.output,
-                                    }
-                                ]
-                            }
-                        }));
-                    }
-                    vec![
-                        json!({
-                            "role": "assistant",
-                            "content": assistant_parts,
-                        }),
-                        json!({
-                            "role": "user",
-                            "content": user_parts,
-                        }),
-                    ]
+                    }));
                 }
             }
-        })
-        .collect();
+        }
+    }
+    let messages = messages_out;
 
     if !network_image_urls.is_empty() {
         bail!(
@@ -477,6 +479,13 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
     Ok(body)
 }
 
+/// Bedrock's `toolResult` content wants a JSON value, but `Message`'s stored tool
+/// result is always text (see `Input::merge_tool_results`). Round-trip back to a
+/// value when the text is itself JSON, falling back to a plain string otherwise.
+fn parse_tool_result_content(text: &str) -> Value {
+    serde_json::from_str(text).unwrap_or_else(|_| json!(text))
+}
+
 fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
     let mut text = String::new();
     let mut reasoning = None;
@@ -510,16 +519,13 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
         }
     }
 
-    if let Some(reasoning) = reasoning {
-        text = format!("<think>\n{reasoning}\n</think>\n\n{text}")
-    }
-
     if text.is_empty() && tool_calls.is_empty() {
         bail!("Invalid response data: {data}");
     }
 
     let output = ChatCompletionsOutput {
         text,
+        reasoning_content: reasoning,
         tool_calls,
         id: None,
         input_tokens: data["usage"]["inputTokens"].as_u64(),

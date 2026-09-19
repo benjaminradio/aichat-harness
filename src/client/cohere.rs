@@ -246,6 +246,7 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
     }
     let output = ChatCompletionsOutput {
         text,
+        reasoning_content: None,
         tool_calls,
         id: data["id"].as_str().map(|v| v.to_string()),
         input_tokens: data["usage"]["billed_units"]["input_tokens"].as_u64(),

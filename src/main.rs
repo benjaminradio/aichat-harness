@@ -2,6 +2,7 @@ mod cli;
 mod client;
 mod config;
 mod function;
+pub mod harness;
 mod rag;
 mod render;
 mod repl;
@@ -99,6 +100,10 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         config.write().dry_run = true;
     }
 
+    if cli.harness.is_some() {
+        config.write().harness_active = true;
+    }
+
     if let Some(agent) = &cli.agent {
         let session = cli.session.as_ref().map(|v| match v {
             Some(v) => v.as_str(),
@@ -115,6 +120,31 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
 
         let ret = Config::use_agent(&config, agent, session, abort_signal.clone()).await;
         config.write().agent_variables = None;
+        ret?;
+    } else if let Some(Some(agent)) = &cli.harness {
+        // `-H <agent>` / `--harness <agent>`: the same underlying activation as
+        // `--agent`, just also flagged as harness-activated so a later `.exit
+        // harness` (REPL) tears the agent down too. Mutually exclusive with the
+        // `--agent` branch above so `--session`/`--agent-variable` are each
+        // consumed exactly once.
+        let session = cli.session.as_ref().map(|v| match v {
+            Some(v) => v.as_str(),
+            None => TEMP_SESSION_NAME,
+        });
+        if !cli.agent_variable.is_empty() {
+            config.write().agent_variables = Some(
+                cli.agent_variable
+                    .chunks(2)
+                    .map(|v| (v[0].to_string(), v[1].to_string()))
+                    .collect(),
+            );
+        }
+
+        let ret = Config::use_agent(&config, agent, session, abort_signal.clone()).await;
+        config.write().agent_variables = None;
+        if ret.is_ok() {
+            config.write().harness_activated_agent = true;
+        }
         ret?;
     } else {
         if let Some(prompt) = &cli.prompt {
@@ -192,42 +222,14 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
     }
 }
 
-#[async_recursion::async_recursion]
 async fn start_directive(
     config: &GlobalConfig,
     input: Input,
     code_mode: bool,
     abort_signal: AbortSignal,
 ) -> Result<()> {
-    let client = input.create_client()?;
     let extract_code = !*IS_STDOUT_TERMINAL && code_mode;
-    config.write().before_chat_completion(&input)?;
-    let (output, tool_results) = if !input.stream() || extract_code {
-        call_chat_completions(
-            &input,
-            true,
-            extract_code,
-            client.as_ref(),
-            abort_signal.clone(),
-        )
-        .await?
-    } else {
-        call_chat_completions_streaming(&input, client.as_ref(), abort_signal.clone()).await?
-    };
-    config
-        .write()
-        .after_chat_completion(&input, &output, &tool_results)?;
-
-    if !tool_results.is_empty() {
-        start_directive(
-            config,
-            input.merge_tool_results(output, tool_results),
-            code_mode,
-            abort_signal,
-        )
-        .await?;
-    }
-
+    harness::run_completion_loop(config, input, extract_code, None, abort_signal).await?;
     config.write().exit_session()?;
     Ok(())
 }
@@ -246,12 +248,12 @@ async fn shell_execute(
 ) -> Result<()> {
     let client = input.create_client()?;
     config.write().before_chat_completion(&input)?;
-    let (eval_str, _) =
+    let (eval_str, reasoning_content, _) =
         call_chat_completions(&input, false, true, client.as_ref(), abort_signal.clone()).await?;
 
     config
         .write()
-        .after_chat_completion(&input, &eval_str, &[])?;
+        .after_chat_completion(&input, &eval_str, &reasoning_content, &[])?;
     if eval_str.is_empty() {
         bail!("No command generated");
     }

@@ -1,0 +1,4 @@
+name: '%code%'
+prompt: "Provide only code without comments or explanations.\n### INPUT:\nasync sleep\
+  \ in js\n### OUTPUT:\n```javascript\nasync function timeout(ms) {\n  return new\
+  \ Promise(resolve => setTimeout(resolve, ms));\n}\n```"

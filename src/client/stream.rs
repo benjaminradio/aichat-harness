@@ -12,6 +12,12 @@ pub struct SseHandler {
     sender: UnboundedSender<SseEvent>,
     abort_signal: AbortSignal,
     buffer: String,
+    /// Accumulates only the clean reasoning text a provider reports via
+    /// `reasoning()` — never the `<think>` tag markup, which is display-only and
+    /// added/removed here as we transition in and out of a reasoning span, not baked
+    /// into anything that ends up in `Message.reasoning_content` or `buffer`.
+    reasoning_buffer: String,
+    in_reasoning: bool,
     tool_calls: Vec<ToolCall>,
 }
 
@@ -21,16 +27,47 @@ impl SseHandler {
             sender,
             abort_signal,
             buffer: String::new(),
+            reasoning_buffer: String::new(),
+            in_reasoning: false,
             tool_calls: Vec::new(),
         }
     }
 
+    /// Regular content text. Providers call this with raw deltas — no tag markup —
+    /// same as before this refactor.
     pub fn text(&mut self, text: &str) -> Result<()> {
         // debug!("HandleText: {}", text);
         if text.is_empty() {
             return Ok(());
         }
+        if self.in_reasoning {
+            self.in_reasoning = false;
+            self.send_text("\n</think>\n\n")?;
+        }
         self.buffer.push_str(text);
+        self.send_text(text)
+    }
+
+    /// Reasoning/thinking text. Providers call this with raw deltas — no tag
+    /// markup — replacing the old pattern where each provider file tracked its own
+    /// "have I opened the <think> tag yet" boolean and hand-inserted the markers
+    /// into `text()` calls. That bookkeeping now lives here, once, and the markup
+    /// itself only ever reaches the live-display channel (`SseEvent::Text`) — the
+    /// accumulated `reasoning_buffer` that becomes `Message.reasoning_content`
+    /// stays clean.
+    pub fn reasoning(&mut self, text: &str) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        if !self.in_reasoning {
+            self.in_reasoning = true;
+            self.send_text("<think>\n")?;
+        }
+        self.reasoning_buffer.push_str(text);
+        self.send_text(text)
+    }
+
+    fn send_text(&mut self, text: &str) -> Result<()> {
         let ret = self
             .sender
             .send(SseEvent::Text(text.to_string()))
@@ -46,6 +83,10 @@ impl SseHandler {
 
     pub fn done(&mut self) {
         // debug!("HandleDone");
+        if self.in_reasoning {
+            self.in_reasoning = false;
+            let _ = self.send_text("\n</think>\n\n");
+        }
         let ret = self.sender.send(SseEvent::Done);
         if ret.is_err() {
             if self.abort_signal.aborted() {
@@ -69,11 +110,19 @@ impl SseHandler {
         &self.tool_calls
     }
 
-    pub fn take(self) -> (String, Vec<ToolCall>) {
+    pub fn take(self) -> (String, Option<String>, Vec<ToolCall>) {
         let Self {
-            buffer, tool_calls, ..
+            buffer,
+            reasoning_buffer,
+            tool_calls,
+            ..
         } = self;
-        (buffer, tool_calls)
+        let reasoning_content = if reasoning_buffer.is_empty() {
+            None
+        } else {
+            Some(reasoning_buffer)
+        };
+        (buffer, reasoning_content, tool_calls)
     }
 }
 

@@ -815,7 +815,6 @@ fn ret_err<T: std::fmt::Display>(err: T) -> AppResponse {
 
 fn parse_messages(message: Vec<Value>) -> Result<Vec<Message>> {
     let mut output = vec![];
-    let mut tool_results = None;
     for (i, message) in message.into_iter().enumerate() {
         let err = || anyhow!("Failed to parse '.messages[{i}]'");
         let role = message["role"].as_str().ok_or_else(err)?;
@@ -843,71 +842,41 @@ fn parse_messages(message: Vec<Value>) -> Result<Vec<Message>> {
                 };
                 output.push(Message::new(role, content))
             }
-            "assistant" => {
-                let role = MessageRole::Assistant;
-                match message["tool_calls"].as_array() {
-                    Some(tool_calls) => {
-                        if tool_results.is_some() {
+            "assistant" => match message["tool_calls"].as_array() {
+                Some(tool_calls) => {
+                    let mut list = vec![];
+                    for tool_call in tool_calls {
+                        if let (id, Some(name), Some(arguments)) = (
+                            tool_call["id"].as_str().map(|v| v.to_string()),
+                            tool_call["function"]["name"].as_str(),
+                            tool_call["function"]["arguments"].as_str(),
+                        ) {
+                            let arguments = serde_json::from_str(arguments).map_err(|_| err())?;
+                            list.push(ToolCall::new(name.to_string(), arguments, id));
+                        } else {
                             return Err(err());
                         }
-                        let mut list = vec![];
-                        for tool_call in tool_calls {
-                            if let (id, Some(name), Some(arguments)) = (
-                                tool_call["id"].as_str().map(|v| v.to_string()),
-                                tool_call["function"]["name"].as_str(),
-                                tool_call["function"]["arguments"].as_str(),
-                            ) {
-                                let arguments =
-                                    serde_json::from_str(arguments).map_err(|_| err())?;
-                                list.push((id, name.to_string(), arguments));
-                            } else {
-                                return Err(err());
-                            }
-                        }
-                        tool_results = Some((content.to_text(), list, vec![]));
                     }
-                    None => output.push(Message::new(role, content)),
+                    output.push(Message::new_assistant_tool_calls(
+                        content.to_text(),
+                        list,
+                        None,
+                    ));
                 }
-            }
-            "tool" => match tool_results.take() {
-                Some((text, tool_calls, mut tool_values)) => {
-                    let tool_call_id = message["tool_call_id"].as_str().map(|v| v.to_string());
-                    let content = content.to_text();
-                    let value: Value = serde_json::from_str(&content)
-                        .ok()
-                        .unwrap_or_else(|| content.into());
-
-                    tool_values.push((value, tool_call_id));
-
-                    if tool_calls.len() == tool_values.len() {
-                        let mut list = vec![];
-                        for ((id, name, arguments), (value, tool_call_id)) in
-                            tool_calls.into_iter().zip(tool_values.into_iter())
-                        {
-                            if id != tool_call_id {
-                                return Err(err());
-                            }
-                            list.push(ToolResult::new(ToolCall::new(name, arguments, id), value))
-                        }
-                        output.push(Message::new(
-                            MessageRole::Assistant,
-                            MessageContent::ToolCalls(MessageContentToolCalls::new(list, text)),
-                        ));
-                        tool_results = None;
-                    } else {
-                        tool_results = Some((text, tool_calls, tool_values));
-                    }
-                }
-                None => return Err(err()),
+                None => output.push(Message::new(MessageRole::Assistant, content)),
             },
+            "tool" => {
+                let tool_call_id = message["tool_call_id"].as_str().map(|v| v.to_string());
+                output.push(Message::new_tool_result(
+                    tool_call_id,
+                    content.to_text(),
+                    None,
+                ));
+            }
             _ => {
                 return Err(err());
             }
         }
-    }
-
-    if tool_results.is_some() {
-        bail!("Invalid messages");
     }
 
     Ok(output)
