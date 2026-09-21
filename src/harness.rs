@@ -55,9 +55,16 @@ pub async fn run_completion_loop(
         let client = input.create_client()?;
         config.write().before_chat_completion(&input)?;
         let (output, reasoning_content, tool_results) = if !input.stream() || extract_code {
+            // Same suppression `render::render_stream` applies to the streaming
+            // path, mirrored here for the non-streaming one: a spawned
+            // subagent's own output stays hidden when `show_subagent` is off.
+            let print = {
+                let cfg = config.read();
+                !(cfg.agent_depth > 0 && !cfg.show_subagent)
+            };
             call_chat_completions(
                 &input,
-                true,
+                print,
                 extract_code,
                 client.as_ref(),
                 abort_signal.clone(),

@@ -177,6 +177,8 @@ impl Session {
         &self,
         render: &mut MarkdownRender,
         agent_info: &Option<(String, Vec<String>)>,
+        show_thinking: bool,
+        show_subagent: bool,
     ) -> Result<String> {
         let mut items = vec![];
 
@@ -232,10 +234,12 @@ impl Session {
                         );
                     }
                     MessageRole::Assistant => {
-                        if let Some(reasoning) = &message.reasoning_content {
-                            let text = format_reasoning(reasoning);
-                            if !text.is_empty() {
-                                lines.push(render.render(&text));
+                        if show_thinking {
+                            if let Some(reasoning) = &message.reasoning_content {
+                                let text = format_reasoning(reasoning);
+                                if !text.is_empty() {
+                                    lines.push(render.render(&text));
+                                }
                             }
                         }
                         if let MessageContent::Text(text) = &message.content {
@@ -269,7 +273,12 @@ impl Session {
                     }
                     MessageRole::Tool => {
                         let text = message.content.to_text();
-                        lines.push(format_subagent_trace(message.trace.as_ref(), &text));
+                        let text = if show_subagent {
+                            format_subagent_trace(message.trace.as_ref(), &text)
+                        } else {
+                            text
+                        };
+                        lines.push(text);
                     }
                 }
             }
@@ -326,6 +335,16 @@ impl Session {
 
     pub fn agent_instructions(&self) -> &str {
         &self.agent_instructions
+    }
+
+    /// This session's stored message history -- `messages`, not the (larger,
+    /// including `input`'s own about-to-be-added turn) result of
+    /// `build_messages`. Used to detect whether the session was left with an
+    /// unanswered `MessageRole::User` turn (e.g. the process was interrupted
+    /// before the assistant replied) -- see
+    /// `crate::repl::maybe_complete_pending_turn`.
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
     }
 
     pub fn set_save_session(&mut self, value: Option<bool>) {
@@ -554,6 +573,16 @@ impl Session {
         serde_yaml::to_string(&messages).unwrap_or_else(|_| "Unable to echo message".into())
     }
 
+    /// The last message in the returned list is `MessageRole::User` in every
+    /// case except `continue_output`/`regenerate` -- including when this
+    /// session's own stored history already ends in an unanswered User turn
+    /// (most commonly: resuming a session that was interrupted before the
+    /// assistant replied) and `input` carries no new content: that existing
+    /// dangling turn is used as-is rather than piling an empty turn on top
+    /// of it. Mirrors `Role::build_messages`'s handling of a prompt
+    /// template's own trailing, unmatched `### INPUT:` section -- which is
+    /// exactly what populates a brand new session's initial messages here
+    /// (the `len == 0` branch below), so the two compose correctly.
     pub fn build_messages(&self, input: &Input) -> Vec<Message> {
         let mut messages = self.messages.clone();
         if input.continue_output().is_some() {
@@ -568,22 +597,23 @@ impl Session {
             }
             return messages;
         }
-        let mut need_add_msg = true;
         let len = messages.len();
         if len == 0 {
             messages = input.role().build_messages(input);
-            need_add_msg = false;
-        } else if len == 1 && self.compressed_messages.len() >= 2 {
-            if let Some(index) = self
-                .compressed_messages
-                .iter()
-                .rposition(|v| v.role == MessageRole::User)
-            {
-                messages.extend(self.compressed_messages[index..].to_vec());
+        } else {
+            if len == 1 && self.compressed_messages.len() >= 2 {
+                if let Some(index) = self
+                    .compressed_messages
+                    .iter()
+                    .rposition(|v| v.role == MessageRole::User)
+                {
+                    messages.extend(self.compressed_messages[index..].to_vec());
+                }
             }
-        }
-        if need_add_msg {
-            messages.push(Message::new(MessageRole::User, input.message_content()));
+            let already_ends_in_user = messages.last().is_some_and(|m| m.role.is_user());
+            if !input.is_empty() || !already_ends_in_user {
+                messages.push(Message::new(MessageRole::User, input.message_content()));
+            }
         }
         messages
     }

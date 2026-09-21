@@ -240,6 +240,15 @@ Type ".help" for additional help.
             )
         }
 
+        // Whatever got the REPL here (a bare startup into an already-active
+        // role/agent/session via CLI flags, most commonly) may have left the
+        // message list ending in an unanswered User turn -- see
+        // `maybe_complete_pending_turn`'s own doc comment for exactly when.
+        // Fire that completion before the first prompt, so activating
+        // straight into it shows the generation immediately rather than
+        // waiting for an empty enter.
+        maybe_complete_pending_turn(&self.config, self.abort_signal.clone()).await?;
+
         loop {
             if self.abort_signal.aborted_ctrld() {
                 break;
@@ -453,6 +462,7 @@ pub async fn run_repl_command(
                             config.write().new_role(name)?;
                         }
                         config.write().use_role(name)?;
+                        maybe_complete_pending_turn(config, abort_signal.clone()).await?;
                     }
                 },
                 None => println!(
@@ -464,6 +474,7 @@ pub async fn run_repl_command(
             ".session" => {
                 config.write().use_session(args)?;
                 Config::maybe_autoname_session(config.clone());
+                maybe_complete_pending_turn(config, abort_signal.clone()).await?;
             }
             ".rag" => {
                 Config::use_rag(config, args, abort_signal.clone()).await?;
@@ -492,6 +503,7 @@ pub async fn run_repl_command(
                             .await;
                     config.write().agent_variables = None;
                     ret?;
+                    maybe_complete_pending_turn(config, abort_signal.clone()).await?;
                 }
                 None => {
                     println!(r#"Usage: .agent <agent-name> [session-name] [key=value]..."#)
@@ -768,6 +780,13 @@ async fn ask(
     if with_embeddings {
         input.use_embeddings(abort_signal.clone()).await?;
     }
+    run_completion(config, input, abort_signal).await
+}
+
+/// The part of `ask` after its "is there anything to send" gate -- shared
+/// with `maybe_complete_pending_turn`, which has already done its own
+/// (different) check by the time it calls this.
+async fn run_completion(config: &GlobalConfig, input: Input, abort_signal: AbortSignal) -> Result<()> {
     while config.read().is_compressing_session() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -776,6 +795,52 @@ async fn ask(
 
     Config::maybe_autoname_session(config.clone());
     Config::maybe_compress_session(config.clone());
+    Ok(())
+}
+
+/// If there's a genuine pending turn -- a prompt template's own trailing,
+/// unmatched `### INPUT:` section (see `Role::dangling_input`), or a resumed
+/// session whose last saved message is an unanswered User turn (e.g. the
+/// process was interrupted before the assistant replied) -- fire a
+/// completion for it immediately, as if the person had pressed enter on an
+/// empty line, instead of waiting for one.
+///
+/// An ordinary human turn always appends its own new User message on top of
+/// whatever's there, so this only ever needs checking right after
+/// activation (nothing else changes the "current" message list/prompt):
+/// called at REPL startup and after `.role`/`.session`/`.agent` switch the
+/// active context. Not called anywhere in CLI (non-REPL) mode --
+/// `WorkingMode::Cmd` is only ever selected when there's real text (or a
+/// file) to send, so this situation can't arise there.
+async fn maybe_complete_pending_turn(config: &GlobalConfig, abort_signal: AbortSignal) -> Result<()> {
+    // Deliberately NOT "does `build_messages()` end in `MessageRole::User`" --
+    // that's true for almost every normal, nothing-pending call (an empty
+    // prompt with empty input still produces `[User("")]`; a plain system
+    // prompt with no dangling section still ends up `[System(..), User("")]`),
+    // which was the bug in an earlier version of this check: it fired on
+    // every REPL launch, not just a genuine pending turn. Two precise,
+    // source-specific checks instead:
+    let pending = {
+        let cfg = config.read();
+        match cfg.session.as_ref().filter(|s| !s.messages().is_empty()) {
+            // An existing session already has real content -- pending only if
+            // its own last *stored* message (not `build_messages`' output,
+            // which always ends in User) is an unanswered User turn, e.g. the
+            // process was interrupted before the assistant replied.
+            Some(session) => session.messages().last().is_some_and(|m| m.role.is_user()),
+            // No session, or a brand new empty one: pending only if the
+            // active role/agent's prompt template itself has a genuine
+            // trailing, unmatched `### INPUT:` section (see
+            // `Role::dangling_input`) -- not merely because it has *a*
+            // system prompt, which is the ordinary case for almost every
+            // role/agent and isn't "pending" anything.
+            None => cfg.extract_role().dangling_input().is_some(),
+        }
+    };
+    if pending {
+        let input = Input::from_str(config, "", None);
+        run_completion(config, input, abort_signal).await?;
+    }
     Ok(())
 }
 

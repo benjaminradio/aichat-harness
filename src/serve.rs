@@ -325,7 +325,10 @@ impl Server {
             tokio::spawn(async move {
                 let is_first = Arc::new(AtomicBool::new(true));
                 let (sse_tx, sse_rx) = unbounded_channel();
-                let mut handler = SseHandler::new(sse_tx, abort_signal);
+                // API responses always include reasoning content, regardless of the
+                // CLI/REPL's own `show_thinking` display preference -- that's a
+                // terminal-display setting, not part of this server's API contract.
+                let mut handler = SseHandler::new(sse_tx, abort_signal, true);
                 async fn map_event(
                     mut sse_rx: UnboundedReceiver<SseEvent>,
                     tx: &UnboundedSender<ResEvent>,
@@ -340,6 +343,9 @@ impl Server {
                             SseEvent::Text(text) => {
                                 let _ = tx.send(ResEvent::Text(text));
                             }
+                            // No payload, and this server always shows/forwards
+                            // reasoning content anyway (see above) -- nothing to do.
+                            SseEvent::ReasoningStart => {}
                             SseEvent::Done => {
                                 let _ = tx.send(ResEvent::Done);
                                 sse_rx.close();

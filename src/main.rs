@@ -3,6 +3,7 @@ mod client;
 mod config;
 mod function;
 pub mod harness;
+mod lua_tool;
 mod rag;
 mod render;
 mod repl;

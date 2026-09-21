@@ -16,19 +16,28 @@ pub struct SseHandler {
     /// `reasoning()` — never the `<think>` tag markup, which is display-only and
     /// added/removed here as we transition in and out of a reasoning span, not baked
     /// into anything that ends up in `Message.reasoning_content` or `buffer`.
+    /// Always accumulated regardless of `show_thinking` -- suppressing
+    /// *display* never means losing the data.
     reasoning_buffer: String,
     in_reasoning: bool,
+    /// Whether the `<think>`/`</think>` tag markup and reasoning text itself
+    /// reach the live-display channel at all (see `text()`/`reasoning()`).
+    /// `SseEvent::ReasoningStart` is sent regardless -- it carries no text,
+    /// so it's not a display, just a signal a consumer can use to relabel
+    /// e.g. a spinner even while the reasoning text itself stays hidden.
+    show_thinking: bool,
     tool_calls: Vec<ToolCall>,
 }
 
 impl SseHandler {
-    pub fn new(sender: UnboundedSender<SseEvent>, abort_signal: AbortSignal) -> Self {
+    pub fn new(sender: UnboundedSender<SseEvent>, abort_signal: AbortSignal, show_thinking: bool) -> Self {
         Self {
             sender,
             abort_signal,
             buffer: String::new(),
             reasoning_buffer: String::new(),
             in_reasoning: false,
+            show_thinking,
             tool_calls: Vec::new(),
         }
     }
@@ -42,7 +51,9 @@ impl SseHandler {
         }
         if self.in_reasoning {
             self.in_reasoning = false;
-            self.send_text("\n</think>\n\n")?;
+            if self.show_thinking {
+                self.send_text("\n</think>\n\n")?;
+            }
         }
         self.buffer.push_str(text);
         self.send_text(text)
@@ -61,17 +72,27 @@ impl SseHandler {
         }
         if !self.in_reasoning {
             self.in_reasoning = true;
-            self.send_text("<think>\n")?;
+            self.send_event(SseEvent::ReasoningStart)?;
+            if self.show_thinking {
+                self.send_text("<think>\n")?;
+            }
         }
         self.reasoning_buffer.push_str(text);
-        self.send_text(text)
+        if self.show_thinking {
+            self.send_text(text)?;
+        }
+        Ok(())
     }
 
     fn send_text(&mut self, text: &str) -> Result<()> {
+        self.send_event(SseEvent::Text(text.to_string()))
+    }
+
+    fn send_event(&mut self, event: SseEvent) -> Result<()> {
         let ret = self
             .sender
-            .send(SseEvent::Text(text.to_string()))
-            .with_context(|| "Failed to send SseEvent:Text");
+            .send(event)
+            .with_context(|| "Failed to send SseEvent");
         if let Err(err) = ret {
             if self.abort_signal.aborted() {
                 return Ok(());
@@ -85,7 +106,9 @@ impl SseHandler {
         // debug!("HandleDone");
         if self.in_reasoning {
             self.in_reasoning = false;
-            let _ = self.send_text("\n</think>\n\n");
+            if self.show_thinking {
+                let _ = self.send_text("\n</think>\n\n");
+            }
         }
         let ret = self.sender.send(SseEvent::Done);
         if ret.is_err() {
@@ -129,6 +152,13 @@ impl SseHandler {
 #[derive(Debug)]
 pub enum SseEvent {
     Text(String),
+    /// Sent once, the moment a reasoning span starts (regardless of
+    /// `show_thinking` -- see `SseHandler::reasoning`), carrying no text of
+    /// its own. Purely a signal for a live-display consumer to relabel its
+    /// spinner (see `render/stream.rs`); `serve.rs` ignores it. The actual
+    /// reasoning text still arrives via `Text`, tag-wrapped exactly as
+    /// before, only when `show_thinking` is true.
+    ReasoningStart,
     Done,
 }
 
@@ -293,6 +323,84 @@ mod tests {
     use bytes::Bytes;
     use futures_util::stream;
     use rand::Rng;
+
+    fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<SseEvent>) -> Vec<SseEvent> {
+        let mut events = vec![];
+        while let Ok(evt) = rx.try_recv() {
+            events.push(evt);
+        }
+        events
+    }
+
+    fn assert_text(event: &SseEvent, expected: &str) {
+        match event {
+            SseEvent::Text(t) => assert_eq!(t, expected),
+            other => panic!("expected Text({expected:?}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sse_handler_reasoning_shown_sends_signal_then_tag_wrapped_text() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handler = SseHandler::new(tx, crate::utils::create_abort_signal(), true);
+        handler.reasoning("Let me think").unwrap();
+        handler.reasoning(" some more.").unwrap();
+        handler.text("The answer is 4.").unwrap();
+        handler.done();
+
+        let events = drain(&mut rx);
+        assert!(matches!(events[0], SseEvent::ReasoningStart));
+        assert_text(&events[1], "<think>\n");
+        assert_text(&events[2], "Let me think");
+        assert_text(&events[3], " some more.");
+        assert_text(&events[4], "\n</think>\n\n");
+        assert_text(&events[5], "The answer is 4.");
+        assert!(matches!(events[6], SseEvent::Done));
+        assert_eq!(events.len(), 7);
+
+        let (buffer, reasoning_content, _) = handler.take();
+        assert_eq!(buffer, "The answer is 4.");
+        assert_eq!(
+            reasoning_content.as_deref(),
+            Some("Let me think some more.")
+        );
+    }
+
+    #[test]
+    fn sse_handler_reasoning_hidden_still_signals_but_sends_no_text() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handler = SseHandler::new(tx, crate::utils::create_abort_signal(), false);
+        handler.reasoning("secret reasoning").unwrap();
+        handler.text("visible answer").unwrap();
+        handler.done();
+
+        let events = drain(&mut rx);
+        // ReasoningStart still fires (a consumer can relabel a spinner from it),
+        // but none of the reasoning text or tag markup does -- straight to the
+        // regular text once it starts.
+        assert!(matches!(events[0], SseEvent::ReasoningStart));
+        assert_text(&events[1], "visible answer");
+        assert!(matches!(events[2], SseEvent::Done));
+        assert_eq!(events.len(), 3);
+
+        // Suppressing display never means losing the data: still fully captured.
+        let (buffer, reasoning_content, _) = handler.take();
+        assert_eq!(buffer, "visible answer");
+        assert_eq!(reasoning_content.as_deref(), Some("secret reasoning"));
+    }
+
+    #[test]
+    fn sse_handler_no_reasoning_never_sends_reasoning_start() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handler = SseHandler::new(tx, crate::utils::create_abort_signal(), true);
+        handler.text("just an answer").unwrap();
+        handler.done();
+
+        let events = drain(&mut rx);
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, SseEvent::ReasoningStart)));
+    }
 
     fn split_chunks(text: &str) -> Vec<Vec<u8>> {
         let mut rng = rand::rng();

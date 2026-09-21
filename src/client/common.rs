@@ -454,7 +454,7 @@ pub async fn call_chat_completions_streaming(
     abort_signal: AbortSignal,
 ) -> Result<(String, Option<String>, Vec<ToolResult>)> {
     let (tx, rx) = unbounded_channel();
-    let mut handler = SseHandler::new(tx, abort_signal.clone());
+    let mut handler = SseHandler::new(tx, abort_signal.clone(), client.global_config().read().show_thinking);
 
     let (send_ret, render_ret) = tokio::join!(
         client.chat_completions_streaming(input, &mut handler),

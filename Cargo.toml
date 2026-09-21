@@ -68,6 +68,7 @@ which = "8.0.0"
 fuzzy-matcher = "0.3.7"
 terminal-colorsaurus = "0.4.8"
 duct = "1.0.0"
+mlua = { version = "0.11", features = ["lua54", "vendored"] }
 
 [dependencies.reqwest]
 version = "0.12.0"

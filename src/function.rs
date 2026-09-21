@@ -86,8 +86,19 @@ pub struct Functions {
 }
 
 impl Functions {
-    pub fn init(declarations_path: &Path) -> Result<Self> {
-        let declarations: Vec<FunctionDeclaration> = if declarations_path.exists() {
+    /// Loads declarations from `declarations_path`'s `functions.json` (if it
+    /// exists) and merges in any declarations discovered from the `.lua`
+    /// files directly inside `lua_dir` (NOT a `bin/` subdirectory of it --
+    /// that stays reserved for external-process tools; see
+    /// `crate::lua_tool`'s module docs) via
+    /// [`crate::lua_tool::discover_declarations`], whose name isn't already
+    /// covered by `functions.json` -- an explicit `functions.json` entry
+    /// always wins over discovery, so a hand-written declaration is still a
+    /// way to override or annotate a Lua tool. `is_agent` sets the
+    /// discovered declarations' `agent` flag, mirroring what an agent's own
+    /// `functions.json` would set by hand.
+    pub fn init(declarations_path: &Path, lua_dir: &Path, is_agent: bool) -> Result<Self> {
+        let mut declarations: Vec<FunctionDeclaration> = if declarations_path.exists() {
             let ctx = || {
                 format!(
                     "Failed to load functions at {}",
@@ -99,6 +110,19 @@ impl Functions {
         } else {
             vec![]
         };
+
+        if crate::lua_tool::has_lua_tools(lua_dir) {
+            let existing: HashSet<String> = declarations.iter().map(|v| v.name.clone()).collect();
+            let discovered = crate::lua_tool::discover_declarations(lua_dir, is_agent)
+                .with_context(|| {
+                    format!("Failed to discover Lua tools in {}", lua_dir.display())
+                })?;
+            for declaration in discovered {
+                if !existing.contains(&declaration.name) {
+                    declarations.push(declaration);
+                }
+            }
+        }
 
         Ok(Self { declarations })
     }
@@ -244,9 +268,20 @@ impl ToolCall {
         config: &GlobalConfig,
         abort_signal: AbortSignal,
     ) -> Result<(Value, Option<Value>)> {
-        // Single interception point for non-external-process tool kinds. When a
-        // future Lua-backed kind lands, it becomes a third arm here rather than
-        // another edit to the dispatch below.
+        // Interception point for tool kinds that don't go through
+        // `run_llm_function`'s executable search at all:
+        // - `spawn_subagent` is synthetic (it has no declaration in
+        //   `Functions` at all), so it has to be intercepted here, before the
+        //   `extract_call_config_from_agent`/`extract_call_config_from_config`
+        //   resolution below even runs.
+        // Lua-backed tools are NOT like that -- a Lua tool has a declaration
+        // in `Functions` (either hand-written in `functions.json`, or
+        // auto-discovered from its own Lua source -- see
+        // `Functions::init`/`crate::lua_tool::discover_declarations`) and
+        // goes through the exact same `cmd_name`/`cmd_args`/`envs`
+        // resolution as an external-process tool. Only the final dispatch
+        // step differs; see the `lua_tools` branch below, right before the
+        // `run_llm_function` call it's a sibling to.
         if self.name == SPAWN_SUBAGENT_TOOL_NAME && !agent_declares_override(config, &self.name) {
             return self.eval_spawn_subagent(config, abort_signal).await;
         }
@@ -269,6 +304,25 @@ impl ToolCall {
                 self.arguments
             );
         };
+
+        if config.read().lua_tools {
+            let lua_dir = crate::lua_tool::lua_tools_dir_for(&cmd_name, &cmd_args);
+            if crate::lua_tool::has_lua_tools(&lua_dir) {
+                if let Some(output) = crate::lua_tool::run_lua_tool(
+                    lua_dir,
+                    self.name.clone(),
+                    json_data.clone(),
+                    envs.clone(),
+                )
+                .await?
+                {
+                    return Ok((output, None));
+                }
+                // No tool named `self.name` was found among the `.lua` files in
+                // that directory -- fall through to the executable search below,
+                // exactly as if this feature didn't exist for this call.
+            }
+        }
 
         cmd_args.push(json_data.to_string());
 
@@ -409,7 +463,13 @@ impl ToolCall {
             }
             cfg.agent = Some(agent);
         }
-        child_config.write().init_agent_shared_variables()?;
+        // `Some(&input_text)` here is what lets a Lua/external `_instructions`
+        // for this agent see the task it's being spawned to do -- `input_text`
+        // is already in scope (extracted at the top of this function), so no
+        // reordering is needed to thread it through.
+        child_config
+            .write()
+            .init_agent_shared_variables(Some(&input_text))?;
 
         let max_turns = child_config
             .read()
@@ -419,17 +479,36 @@ impl ToolCall {
 
         let input = Input::from_str(&child_config, &input_text, None);
 
+        let show_subagent = config.read().show_subagent;
+
         // Sequential dispatch within eval_tool_calls guarantees no concurrent
         // subagent stream can interleave with this one, so plain open/close tags are
-        // unambiguous. Mirrors how reasoning is wrapped in <think> tags.
+        // unambiguous. Mirrors how reasoning is wrapped in <think> tags. Dimmed
+        // (rather than a bare `println!`) so they read as a boundary marker in the
+        // terminal instead of flat, unstyled text -- everything else printed here
+        // (tool-call traces, etc.) already goes through `dimmed_text` the same way.
+        //
+        // When `show_subagent` is off, these -- and the subagent's own nested
+        // stream, suppressed independently in `render::render_stream`/
+        // `harness::run_completion_loop` via `agent_depth` -- are replaced by a
+        // "Subagent" spinner for the call's duration instead: the result and its
+        // trace (for `.info session`) are unaffected either way, only what's shown.
+        let mut spinner = None;
         if stream {
-            println!("<subagent agent=\"{agent_name}\">");
+            if show_subagent {
+                println!("{}", dimmed_text(&format!("<subagent agent=\"{agent_name}\">")));
+            } else {
+                spinner = Some(spawn_spinner("Subagent"));
+            }
         }
         let result =
             crate::harness::run_completion_loop(&child_config, input, false, max_turns, abort_signal)
                 .await;
-        if stream {
-            println!("</subagent>");
+        if let Some(spinner) = spinner.take() {
+            spinner.stop();
+        }
+        if stream && show_subagent {
+            println!("{}", dimmed_text("</subagent>"));
         }
 
         let outcome = result?;

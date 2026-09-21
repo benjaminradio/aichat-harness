@@ -43,16 +43,23 @@ pub async fn raw_stream(
             break;
         }
         if let Some(evt) = rx.recv().await {
-            if let Some(spinner) = spinner.take() {
-                spinner.stop();
-            }
-
             match evt {
+                SseEvent::ReasoningStart => {
+                    if let Some(spinner) = &spinner {
+                        let _ = spinner.set_message("Thinking".to_string());
+                    }
+                }
                 SseEvent::Text(text) => {
+                    if let Some(spinner) = spinner.take() {
+                        spinner.stop();
+                    }
                     print!("{text}");
                     stdout().flush()?;
                 }
                 SseEvent::Done => {
+                    if let Some(spinner) = spinner.take() {
+                        spinner.stop();
+                    }
                     break;
                 }
             }
@@ -82,12 +89,17 @@ async fn markdown_stream_inner(
             break;
         }
         for reply_event in gather_events(&mut rx).await {
-            if let Some(spinner) = spinner.take() {
-                spinner.stop();
-            }
-
             match reply_event {
+                SseEvent::ReasoningStart => {
+                    if let Some(spinner) = &spinner {
+                        let _ = spinner.set_message("Thinking".to_string());
+                    }
+                }
                 SseEvent::Text(mut text) => {
+                    if let Some(spinner) = spinner.take() {
+                        spinner.stop();
+                    }
+
                     // tab width hacking
                     text = text.replace('\t', "    ");
 
@@ -146,6 +158,9 @@ async fn markdown_stream_inner(
                     writer.flush()?;
                 }
                 SseEvent::Done => {
+                    if let Some(spinner) = spinner.take() {
+                        spinner.stop();
+                    }
                     break 'outer;
                 }
             }
@@ -162,14 +177,27 @@ async fn markdown_stream_inner(
     Ok(())
 }
 
+/// Batches consecutive `Text` events (joined into one) within a short window,
+/// same as before -- but `ReasoningStart` is never merged into that batch:
+/// it's emitted as its own event, in its correct position relative to any
+/// text gathered before/after it, since it's a boundary signal (see
+/// `SseEvent::ReasoningStart`) a consumer needs to see distinctly, not text
+/// content to concatenate.
 async fn gather_events(rx: &mut UnboundedReceiver<SseEvent>) -> Vec<SseEvent> {
-    let mut texts = vec![];
+    let mut events: Vec<SseEvent> = vec![];
+    let mut pending_text = String::new();
     let mut done = false;
     tokio::select! {
         _ = async {
             while let Some(reply_event) = rx.recv().await {
                 match reply_event {
-                    SseEvent::Text(v) => texts.push(v),
+                    SseEvent::Text(v) => pending_text.push_str(&v),
+                    SseEvent::ReasoningStart => {
+                        if !pending_text.is_empty() {
+                            events.push(SseEvent::Text(std::mem::take(&mut pending_text)));
+                        }
+                        events.push(SseEvent::ReasoningStart);
+                    }
                     SseEvent::Done => {
                         done = true;
                         break;
@@ -179,14 +207,32 @@ async fn gather_events(rx: &mut UnboundedReceiver<SseEvent>) -> Vec<SseEvent> {
         } => {}
         _ = tokio::time::sleep(Duration::from_millis(50)) => {}
     };
-    let mut events = vec![];
-    if !texts.is_empty() {
-        events.push(SseEvent::Text(texts.join("")))
+    if !pending_text.is_empty() {
+        events.push(SseEvent::Text(pending_text));
     }
     if done {
         events.push(SseEvent::Done)
     }
     events
+}
+
+/// Consumes a completion's stream without displaying any of it -- used for a
+/// spawned subagent's own stream when `show_subagent` is off (see
+/// `render::render_stream`). The actual output/reasoning text is unaffected:
+/// that's accumulated inside `SseHandler` independently of whether anything
+/// here gets displayed, so the caller still gets a correct result either
+/// way -- this only controls what appears on the terminal.
+pub async fn drain_stream(mut rx: UnboundedReceiver<SseEvent>, abort_signal: &AbortSignal) -> Result<()> {
+    loop {
+        if abort_signal.aborted() {
+            break;
+        }
+        match rx.recv().await {
+            Some(SseEvent::Done) | None => break,
+            Some(_) => {}
+        }
+    }
+    Ok(())
 }
 
 fn print_block(writer: &mut Stdout, text: &str, columns: u16) -> Result<u16> {

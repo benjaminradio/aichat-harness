@@ -17,6 +17,23 @@ function_calling: true           # Enables or disables function calling (Globall
 mapping_tools:                   # Alias for a tool or toolset
   fs: 'fs_cat,fs_ls,fs_mkdir,fs_rm,fs_write'
 use_tools: null                  # Which tools to use by default. (e.g. 'fs,web_search')
+lua_tools: true                  # Enables or disables the Lua tool backend. A tool with a matching `.lua` file
+                                  # directly in functions/ (or an agent's own directory, not its bin/ subdir --
+                                  # bin/ stays reserved for external-process tools) runs in-process via an
+                                  # embedded Lua VM instead of as an external executable, and no longer needs a
+                                  # hand-written functions.json entry -- its declaration (name, description,
+                                  # parameters) is discovered directly from the Lua source (register(), doc
+                                  # comments, or the function's own parameter names). Set to false to always use
+                                  # the external-process backend and require functions.json, as if this feature
+                                  # didn't exist.
+show_thinking: true              # Show reasoning/thinking content (both live and in `.info session`/session
+                                  # replay). The full reasoning text is always captured either way; this only
+                                  # controls whether it's displayed. Pairs well with a "Thinking" spinner label
+                                  # while it's suppressed.
+show_subagent: true              # Show a spawned subagent's own generated content (its <subagent> boundary
+                                  # markers and nested streamed output). When false, only a "Subagent" spinner is
+                                  # shown for the call's duration -- the subagent's result and its trace (for
+                                  # `.info session`) are unaffected either way.
 
 # ---- harness / subagents ----
 use_agents: null                 # Which agents may be spawned as subagents. (e.g. 'coder,researcher' or 'all'). null = no subagents callable

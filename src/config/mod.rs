@@ -121,6 +121,26 @@ pub struct Config {
 
     pub function_calling: bool,
     pub mapping_tools: IndexMap<String, String>,
+    /// Kill switch for the Lua tool backend (`src/lua_tool.rs`). Checked before
+    /// even looking for a `.lua` file for a given tool call; when `false`,
+    /// dispatch goes straight to the existing external-process search, as if
+    /// this feature didn't exist. Defaults to `true`.
+    pub lua_tools: bool,
+
+    /// Whether reasoning/thinking content is shown live (streaming) and in
+    /// `.info session`/session replay -- `Message.reasoning_content` is
+    /// always captured either way (see `SseHandler::reasoning`); this only
+    /// controls display. Defaults to `true`.
+    pub show_thinking: bool,
+    /// Whether a spawned subagent's own generated content (its `<subagent
+    /// agent="...">...</subagent>` boundary markers and its nested
+    /// streamed/printed output) is shown live; when `false`, only a
+    /// "Subagent" spinner is shown for the duration of the call -- see
+    /// `crate::function::eval_spawn_subagent`. The subagent's actual result
+    /// text (what the tool call returns to the model) and its trace (stored
+    /// for `.info session`) are unaffected either way; this only controls
+    /// display. Defaults to `true`.
+    pub show_subagent: bool,
 
     pub repl_prelude: Option<String>,
     pub cmd_prelude: Option<String>,
@@ -217,6 +237,9 @@ impl Default for Config {
 
             function_calling: true,
             mapping_tools: Default::default(),
+            lua_tools: true,
+            show_thinking: true,
+            show_subagent: true,
 
             repl_prelude: None,
             cmd_prelude: None,
@@ -640,6 +663,9 @@ impl Config {
             ("rag_top_k", rag_top_k.to_string()),
             ("dry_run", self.dry_run.to_string()),
             ("function_calling", self.function_calling.to_string()),
+            ("lua_tools", self.lua_tools.to_string()),
+            ("show_thinking", self.show_thinking.to_string()),
+            ("show_subagent", self.show_subagent.to_string()),
             ("stream", self.stream.to_string()),
             ("save", self.save.to_string()),
             ("keybindings", self.keybindings.clone()),
@@ -729,6 +755,18 @@ impl Config {
                     bail!("Function calling cannot be enabled because no functions are installed.")
                 }
                 config.write().function_calling = value;
+            }
+            "lua_tools" => {
+                let value = value.parse().with_context(|| "Invalid value")?;
+                config.write().lua_tools = value;
+            }
+            "show_thinking" => {
+                let value = value.parse().with_context(|| "Invalid value")?;
+                config.write().show_thinking = value;
+            }
+            "show_subagent" => {
+                let value = value.parse().with_context(|| "Invalid value")?;
+                config.write().show_subagent = value;
             }
             "stream" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
@@ -1238,7 +1276,7 @@ impl Config {
                     .collect();
                 (agent.name().to_string(), functions)
             });
-            session.render(&mut markdown_render, &agent_info)
+            session.render(&mut markdown_render, &agent_info, self.show_thinking, self.show_subagent)
         } else {
             bail!("No session")
         }
@@ -1663,7 +1701,7 @@ impl Config {
         if let Some(session) = session {
             config.write().use_session(Some(&session))?;
         } else {
-            config.write().init_agent_shared_variables()?;
+            config.write().init_agent_shared_variables(None)?;
         }
         Ok(())
     }
@@ -1724,7 +1762,7 @@ impl Config {
         if let Some(agent) = self.agent.as_mut() {
             agent.exit_session();
             if self.working_mode.is_repl() {
-                self.init_agent_shared_variables()?;
+                self.init_agent_shared_variables(None)?;
             }
         }
         Ok(())
@@ -1992,6 +2030,9 @@ impl Config {
                         "max_output_tokens",
                         "dry_run",
                         "function_calling",
+                        "lua_tools",
+                        "show_thinking",
+                        "show_subagent",
                         "stream",
                         "save",
                         "highlight",
@@ -2017,6 +2058,9 @@ impl Config {
                 "stream" => complete_bool(self.stream),
                 "save" => complete_bool(self.save),
                 "function_calling" => complete_bool(self.function_calling),
+                "lua_tools" => complete_bool(self.lua_tools),
+                "show_thinking" => complete_bool(self.show_thinking),
+                "show_subagent" => complete_bool(self.show_subagent),
                 "use_tools" => {
                     let mut prefix = String::new();
                     let mut ignores = HashSet::new();
@@ -2401,7 +2445,11 @@ impl Config {
             .with_context(|| "Failed to save message")
     }
 
-    pub(crate) fn init_agent_shared_variables(&mut self) -> Result<()> {
+    /// `input`: the spawning `spawn_subagent` call's own `input` argument when
+    /// the active agent is being activated as a subagent (threaded straight
+    /// through to `Role::update_shared_dynamic_instructions`/`run_instructions_fn`),
+    /// or `None` for every other activation path.
+    pub(crate) fn init_agent_shared_variables(&mut self, input: Option<&str>) -> Result<()> {
         let agent = match self.agent.as_mut() {
             Some(v) => v,
             None => return Ok(()),
@@ -2423,11 +2471,15 @@ impl Config {
             agent.set_shared_variables(new_variables);
         }
         if !self.info_flag {
-            agent.update_shared_dynamic_instructions(false)?;
+            agent.update_shared_dynamic_instructions(false, input, self.lua_tools)?;
         }
         Ok(())
     }
 
+    /// Never called for a spawned subagent -- a subagent has no session at
+    /// all (see `Role::update_session_dynamic_instructions`'s own doc
+    /// comment), so there's no `input` to thread through the dynamic-
+    /// instructions calls below: always `None`.
     fn init_agent_session_variables(&mut self, new_session: bool) -> Result<()> {
         let (agent, session) = match (self.agent.as_mut(), self.session.as_mut()) {
             (Some(agent), Some(session)) => (agent, session),
@@ -2457,15 +2509,16 @@ impl Config {
                 };
             agent.set_session_variables(session_variables);
             if !self.info_flag {
-                agent.update_session_dynamic_instructions(None)?;
+                agent.update_session_dynamic_instructions(None, self.lua_tools)?;
             }
             session.sync_agent(agent);
         } else {
             let variables = session.agent_variables();
             agent.set_session_variables(variables.clone());
-            agent.update_session_dynamic_instructions(Some(
-                session.agent_instructions().to_string(),
-            ))?;
+            agent.update_session_dynamic_instructions(
+                Some(session.agent_instructions().to_string()),
+                self.lua_tools,
+            )?;
         }
         Ok(())
     }
@@ -2574,6 +2627,15 @@ impl Config {
         if let Some(Some(v)) = read_env_bool(&get_env_name("function_calling")) {
             self.function_calling = v;
         }
+        if let Some(Some(v)) = read_env_bool(&get_env_name("lua_tools")) {
+            self.lua_tools = v;
+        }
+        if let Some(Some(v)) = read_env_bool(&get_env_name("show_thinking")) {
+            self.show_thinking = v;
+        }
+        if let Some(Some(v)) = read_env_bool(&get_env_name("show_subagent")) {
+            self.show_subagent = v;
+        }
         if let Ok(v) = env::var(get_env_name("mapping_tools")) {
             if let Ok(v) = serde_json::from_str(&v) {
                 self.mapping_tools = v;
@@ -2672,7 +2734,11 @@ impl Config {
     }
 
     fn load_functions(&mut self) -> Result<()> {
-        self.functions = Functions::init(&Self::functions_file())?;
+        self.functions = Functions::init(
+            &Self::functions_file(),
+            &Self::functions_dir(),
+            false,
+        )?;
         Ok(())
     }
 

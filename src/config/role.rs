@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use inquire::{validator::Validation, Confirm, Text};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fs::read_to_string;
 
 pub const SHELL_ROLE: &str = "%shell%";
@@ -209,11 +210,7 @@ impl Role {
         role.name = name.to_string();
 
         let functions_path = dir.join("functions.json");
-        role.functions = if functions_path.exists() {
-            Functions::init(&functions_path)?
-        } else {
-            Functions::default()
-        };
+        role.functions = Functions::init(&functions_path, &dir, true)?;
         role.replace_tools_placeholder();
 
         role.load_envs();
@@ -415,6 +412,31 @@ impl Role {
         self.effective_prompt().contains(INPUT_PLACEHOLDER)
     }
 
+    /// The prompt template's own trailing, unmatched `### INPUT:` section --
+    /// see `parse_structure_prompt` -- if it has one and it's non-empty
+    /// after trimming. `None` for an empty prompt or an `__INPUT__`-embedded
+    /// one (neither has any `### INPUT:`/`### OUTPUT:` structure at all, so
+    /// the concept doesn't apply), or a structured prompt with no dangling
+    /// section.
+    ///
+    /// This is the precise "does this role/agent have a pending
+    /// pregeneration turn" check -- deliberately *not* "does
+    /// `build_messages` end in `MessageRole::User`", which is true for
+    /// almost every normal call regardless of whether there's anything
+    /// genuinely pending (an ordinary empty-prompt role with empty input
+    /// still produces `[User("")]`, a plain system prompt with no dangling
+    /// section still ends up `[System(..), User("")]`, and so on) -- that
+    /// was the actual bug in an earlier version of this check. See
+    /// `crate::repl::maybe_complete_pending_turn`.
+    pub fn dangling_input(&self) -> Option<String> {
+        if self.is_empty_prompt() || self.is_embedded_prompt() {
+            return None;
+        }
+        let prompt = self.effective_prompt();
+        let (_, _, dangling) = parse_structure_prompt(&prompt);
+        dangling.filter(|v| !v.is_empty()).map(|v| v.to_string())
+    }
+
     pub fn echo_messages(&self, input: &Input) -> String {
         let prompt = self.effective_prompt();
         let input_markdown = input.render();
@@ -427,6 +449,14 @@ impl Role {
         }
     }
 
+    /// The last message in the returned list is `MessageRole::User` in every
+    /// case *except* when `input.continue_output()` is set (a partial
+    /// assistant reply is appended last instead, for `.continue`). In
+    /// particular, when the prompt template has a trailing, unmatched
+    /// `### INPUT:` section and `input` itself carries no real content (the
+    /// common case: called right after activation, before any human input
+    /// exists), that dangling section becomes the final message directly --
+    /// no redundant empty turn on top of it. See `parse_structure_prompt`.
     pub fn build_messages(&self, input: &Input) -> Vec<Message> {
         let prompt = self.effective_prompt();
         let mut content = input.message_content();
@@ -437,7 +467,7 @@ impl Role {
             vec![Message::new(MessageRole::User, content)]
         } else {
             let mut messages = vec![];
-            let (system, cases) = parse_structure_prompt(&prompt);
+            let (system, cases, dangling_input) = parse_structure_prompt(&prompt);
             if !system.is_empty() {
                 messages.push(Message::new(
                     MessageRole::System,
@@ -452,7 +482,21 @@ impl Role {
                     ]
                 }));
             }
-            messages.push(Message::new(MessageRole::User, content));
+            if let Some(dangling) = dangling_input {
+                // Not a few-shot case (no scripted reply to pair with) -- a
+                // turn the model is meant to complete. If there's no real
+                // input to append after it, it simply *is* the final turn.
+                // If there is real input too (unusual, but not disallowed),
+                // it's inserted just before it rather than dropped -- see
+                // this method's own doc comment.
+                messages.push(Message::new(
+                    MessageRole::User,
+                    MessageContent::Text(dangling.to_string()),
+                ));
+            }
+            if !input.is_empty() || dangling_input.is_none() {
+                messages.push(Message::new(MessageRole::User, content));
+            }
             messages
         };
         if let Some(text) = input.continue_output() {
@@ -565,28 +609,93 @@ impl Role {
         self.dynamic_instructions
     }
 
-    pub fn update_shared_dynamic_instructions(&mut self, force: bool) -> Result<()> {
+    pub fn update_shared_dynamic_instructions(
+        &mut self,
+        force: bool,
+        input: Option<&str>,
+        lua_tools_enabled: bool,
+    ) -> Result<()> {
         if self.is_dynamic_instructions() && (force || self.shared_dynamic_instructions.is_none()) {
-            self.shared_dynamic_instructions = Some(self.run_instructions_fn()?);
+            self.shared_dynamic_instructions =
+                Some(self.run_instructions_fn(input, lua_tools_enabled)?);
         }
         Ok(())
     }
 
-    pub fn update_session_dynamic_instructions(&mut self, value: Option<String>) -> Result<()> {
+    pub fn update_session_dynamic_instructions(
+        &mut self,
+        value: Option<String>,
+        lua_tools_enabled: bool,
+    ) -> Result<()> {
         if self.is_dynamic_instructions() {
             let value = match value {
                 Some(v) => v,
-                None => self.run_instructions_fn()?,
+                // Never called for a spawned subagent -- a subagent has no
+                // session at all (`eval_spawn_subagent` calls
+                // `update_shared_dynamic_instructions` instead, with its own
+                // `input`), so there's no per-call `input` to thread through
+                // here: always `None`.
+                None => self.run_instructions_fn(None, lua_tools_enabled)?,
             };
             self.session_dynamic_instructions = Some(value);
         }
         Ok(())
     }
 
-    fn run_instructions_fn(&self) -> Result<String> {
+    /// Computes this agent's dynamic instructions text by invoking
+    /// `_instructions`, checked in the same order a regular tool call would
+    /// use (see `crate::lua_tool`'s module docs): a Lua `_instructions`
+    /// function or `register()` entry directly inside this agent's own
+    /// directory first (when `lua_tools_enabled`), falling back to the
+    /// external executable at `<agent_dir>/bin/_instructions` -- same
+    /// `bin/`-reserved-for-external-tools convention a regular tool call
+    /// uses. Unlike a regular tool, `_instructions` is never offered to the
+    /// model as a callable declaration -- it's invoked directly, by this
+    /// reserved name -- so it doesn't need to be documented
+    /// (`docs._instructions`/a comment block) to be found the way
+    /// `crate::lua_tool::discover_declarations` would require of a
+    /// model-facing tool.
+    ///
+    /// Runs the Lua VM inline via `crate::lua_tool::run_lua_tool_sync` rather
+    /// than the `spawn_blocking`-wrapped `run_lua_tool` a regular tool call
+    /// uses -- same trade-off `Functions::init`/`discover_declarations`
+    /// already make and for the same reason: this only runs once at
+    /// agent/session activation, not on the per-turn tool-call hot path
+    /// `run_lua_tool` exists for, so it isn't worth threading async/lock-
+    /// across-await concerns through the whole activation call chain for.
+    ///
+    /// `input` is the spawning `spawn_subagent` call's own `input` argument
+    /// when this agent is being activated as a subagent, or `None`
+    /// (serialized as JSON `null`) for every other activation path -- a
+    /// plain `.agent`/`--agent` activation has no such input at all.
+    fn run_instructions_fn(&self, input: Option<&str>, lua_tools_enabled: bool) -> Result<String> {
+        let args = json!({ "input": input });
+
+        if lua_tools_enabled {
+            let dir = Config::agent_dir(self.name());
+            if crate::lua_tool::has_lua_tools(&dir) {
+                if let Some(output) = crate::lua_tool::run_lua_tool_sync(
+                    &dir,
+                    "_instructions",
+                    args.clone(),
+                    self.variable_envs(),
+                )? {
+                    return match output {
+                        Value::String(s) => Ok(s),
+                        other => {
+                            bail!("'_instructions' must return a string, got: {other}")
+                        }
+                    };
+                }
+                // No Lua `_instructions` found in that directory -- fall
+                // through to the external executable below, exactly as a
+                // regular tool call would.
+            }
+        }
+
         let value = run_llm_function(
             self.name().to_string(),
-            vec!["_instructions".into(), "{}".into()],
+            vec!["_instructions".into(), args.to_string()],
             self.variable_envs(),
         )?;
         match value {
@@ -766,7 +875,18 @@ impl RoleLike for Role {
     }
 }
 
-fn parse_structure_prompt(prompt: &str) -> (&str, Vec<(&str, &str)>) {
+/// Parses a prompt template into its leading system text, any complete
+/// `### INPUT:`/`### OUTPUT:` few-shot pairs, and -- new -- a trailing,
+/// unmatched `### INPUT:` section, if the prompt ends with one (returned as
+/// the third element). A dangling `### INPUT:` isn't a few-shot example (it
+/// has no scripted reply to pair with); it's a turn meant to be completed by
+/// the model, which is exactly what `Role::build_messages` uses it for.
+///
+/// Previously, an odd number of markers (i.e. exactly this dangling case)
+/// discarded all parsing and returned the whole raw prompt, markers and all,
+/// as one opaque system message -- see this function's tests for the
+/// difference.
+fn parse_structure_prompt(prompt: &str) -> (&str, Vec<(&str, &str)>, Option<&str>) {
     let mut text = prompt;
     let mut search_input = true;
     let mut system = None;
@@ -799,24 +919,71 @@ fn parse_structure_prompt(prompt: &str) -> (&str, Vec<(&str, &str)>) {
             }
         }
     }
-    let parts_len = parts.len();
-    if parts_len > 0 && parts_len % 2 == 0 {
-        let cases: Vec<(&str, &str)> = parts
-            .iter()
-            .step_by(2)
-            .zip(parts.iter().skip(1).step_by(2))
-            .map(|(i, o)| (i.trim(), o.trim()))
-            .collect();
-        let system = system.map(|v| v.trim()).unwrap_or_default();
-        return (system, cases);
+    if parts.is_empty() {
+        // No `### INPUT:`/`### OUTPUT:` structure at all -- unchanged from
+        // before: the whole prompt is the system text, verbatim (not
+        // `system.map(|v| v.trim())`, deliberately, to match prior behavior).
+        return (prompt, vec![], None);
     }
-
-    (prompt, vec![])
+    // An odd count means the last part was pushed right after a `### INPUT:`
+    // match with no following `### OUTPUT:` before the prompt ended -- i.e.
+    // it's the dangling input, not part of a pair. Pop it before pairing up
+    // everything else.
+    let dangling_input = if parts.len() % 2 == 1 {
+        parts.pop().map(|v| v.trim())
+    } else {
+        None
+    };
+    let cases: Vec<(&str, &str)> = parts
+        .iter()
+        .step_by(2)
+        .zip(parts.iter().skip(1).step_by(2))
+        .map(|(i, o)| (i.trim(), o.trim()))
+        .collect();
+    let system = system.map(|v| v.trim()).unwrap_or_default();
+    (system, cases, dangling_input)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dangling_input_none_for_plain_prompts() {
+        // Empty prompt -- no structure of any kind.
+        assert_eq!(Role::new("t", "").dangling_input(), None);
+        // `__INPUT__`-embedded prompt -- different mechanism entirely.
+        assert_eq!(
+            Role::new("t", &format!("Echo: {INPUT_PLACEHOLDER}")).dangling_input(),
+            None
+        );
+        // A plain system prompt with no `### INPUT:`/`### OUTPUT:` markers
+        // at all -- this is the ordinary case for almost every role/agent,
+        // and must NOT be mistaken for a pending turn (this was the actual
+        // bug: an earlier check fired here on every single activation).
+        assert_eq!(
+            Role::new("t", "You are a helpful assistant.").dangling_input(),
+            None
+        );
+        // Complete `### INPUT:`/`### OUTPUT:` pairs, but nothing dangling.
+        assert_eq!(
+            Role::new("t", "System.\n### INPUT:\nIn.\n### OUTPUT:\nOut.\n").dangling_input(),
+            None
+        );
+        // A dangling section that's empty/whitespace-only after trimming.
+        assert_eq!(
+            Role::new("t", "System.\n### INPUT:\n   \n").dangling_input(),
+            None
+        );
+    }
+
+    #[test]
+    fn dangling_input_some_for_a_genuine_trailing_section() {
+        assert_eq!(
+            Role::new("t", "System.\n### INPUT:\nGenerated scene.\n").dangling_input(),
+            Some("Generated scene.".to_string())
+        );
+    }
 
     #[test]
     fn test_parse_structure_prompt1() {
@@ -829,7 +996,7 @@ Output 1
 "#;
         assert_eq!(
             parse_structure_prompt(prompt),
-            ("System message", vec![("Input 1", "Output 1")])
+            ("System message", vec![("Input 1", "Output 1")], None)
         );
     }
 
@@ -843,17 +1010,201 @@ Output 1
 "#;
         assert_eq!(
             parse_structure_prompt(prompt),
-            ("", vec![("Input 1", "Output 1")])
+            ("", vec![("Input 1", "Output 1")], None)
         );
     }
 
     #[test]
     fn test_parse_structure_prompt3() {
+        // A trailing, unmatched `### INPUT:` -- no longer discards all
+        // parsing (see this function's doc comment); it's returned as the
+        // third element instead.
         let prompt = r#"
 System message
 ### INPUT:
 Input 1
 "#;
-        assert_eq!(parse_structure_prompt(prompt), (prompt, vec![]));
+        assert_eq!(
+            parse_structure_prompt(prompt),
+            ("System message", vec![], Some("Input 1"))
+        );
+    }
+
+    #[test]
+    fn test_parse_structure_prompt4() {
+        // Complete few-shot pairs *and* a trailing dangling input together --
+        // the `adventure`-agent shape (a static scene-setting example plus a
+        // final turn meant to be completed).
+        let prompt = r#"
+System message
+### INPUT:
+Input 1
+### OUTPUT:
+Output 1
+### INPUT:
+Input 2
+"#;
+        assert_eq!(
+            parse_structure_prompt(prompt),
+            (
+                "System message",
+                vec![("Input 1", "Output 1")],
+                Some("Input 2")
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_structure_prompt_no_markers_at_all() {
+        // No `### INPUT:`/`### OUTPUT:` structure whatsoever -- unchanged:
+        // the whole prompt, untrimmed, becomes the system text.
+        let prompt = "Just a plain system prompt, no structure.";
+        assert_eq!(parse_structure_prompt(prompt), (prompt, vec![], None));
+    }
+
+    #[test]
+    fn build_messages_uses_dangling_input_as_final_turn_when_input_is_empty() {
+        let config: GlobalConfig = Arc::new(RwLock::new(Config::default()));
+        let role = Role::new(
+            "test",
+            "System text.\n### INPUT:\nGenerated opening scene.\n",
+        );
+        let input = Input::from_str(&config, "", Some(role.clone()));
+        let messages = role.build_messages(&input);
+        // No redundant empty turn on top -- exactly system + the dangling
+        // input as the final (User) message.
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, MessageRole::System);
+        assert_eq!(messages[1].role, MessageRole::User);
+        assert!(
+            matches!(&messages[1].content, MessageContent::Text(t) if t == "Generated opening scene.")
+        );
+    }
+
+    #[test]
+    fn build_messages_keeps_both_turns_when_dangling_input_and_real_input_coexist() {
+        let config: GlobalConfig = Arc::new(RwLock::new(Config::default()));
+        let role = Role::new("test", "### INPUT:\nScene.\n");
+        let input = Input::from_str(&config, "hello", Some(role.clone()));
+        let messages = role.build_messages(&input);
+        // Real input isn't dropped just because the prompt also has a
+        // dangling section -- it's appended after it (see this method's doc
+        // comment for the resulting, unusual-but-tolerated shape).
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|m| m.role == MessageRole::User));
+        assert!(matches!(&messages[0].content, MessageContent::Text(t) if t == "Scene."));
+        assert!(matches!(&messages[1].content, MessageContent::Text(t) if t == "hello"));
+    }
+
+    #[test]
+    fn run_instructions_fn_prefers_lua_over_external() {
+        let agent_name = format!(
+            "aichat_test_instructions_agent_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(&agent_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("_instructions.lua"),
+            r#"
+                function _instructions(input)
+                    return "Lua instructions, input=" .. tostring(input)
+                end
+            "#,
+        )
+        .unwrap();
+        let env_var = format!("{}_AGENT_DIR", normalize_env_name(&agent_name));
+        std::env::set_var(&env_var, &dir);
+
+        let role = Role {
+            kind: RoleKind::Agent,
+            name: agent_name.clone(),
+            dynamic_instructions: true,
+            ..Default::default()
+        };
+
+        let with_input = role.run_instructions_fn(Some("do the task"), true).unwrap();
+        assert_eq!(with_input, "Lua instructions, input=do the task");
+
+        let without_input = role.run_instructions_fn(None, true).unwrap();
+        assert_eq!(without_input, "Lua instructions, input=nil");
+
+        std::env::remove_var(&env_var);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_instructions_fn_requires_a_string_return() {
+        let agent_name = format!(
+            "aichat_test_instructions_nonstring_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(&agent_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("_instructions.lua"),
+            "function _instructions(input) return { oops = true } end",
+        )
+        .unwrap();
+        let env_var = format!("{}_AGENT_DIR", normalize_env_name(&agent_name));
+        std::env::set_var(&env_var, &dir);
+
+        let role = Role {
+            kind: RoleKind::Agent,
+            name: agent_name.clone(),
+            dynamic_instructions: true,
+            ..Default::default()
+        };
+
+        let err = role.run_instructions_fn(None, true).unwrap_err();
+        assert!(err.to_string().contains("must return a string"));
+
+        std::env::remove_var(&env_var);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_instructions_fn_skips_lua_when_disabled() {
+        let agent_name = format!(
+            "aichat_test_instructions_disabled_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(&agent_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("_instructions.lua"),
+            "function _instructions() return \"should not be used\" end",
+        )
+        .unwrap();
+        let env_var = format!("{}_AGENT_DIR", normalize_env_name(&agent_name));
+        std::env::set_var(&env_var, &dir);
+
+        let role = Role {
+            kind: RoleKind::Agent,
+            name: agent_name.clone(),
+            dynamic_instructions: true,
+            ..Default::default()
+        };
+
+        // `lua_tools_enabled: false` -- falls straight to the external-process
+        // path, which fails here since there's no `bin/_instructions`
+        // executable; the point is it does NOT return the Lua function's text.
+        let err = role.run_instructions_fn(None, false).unwrap_err();
+        assert!(!err.to_string().contains("should not be used"));
+
+        std::env::remove_var(&env_var);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
